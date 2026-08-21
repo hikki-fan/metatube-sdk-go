@@ -7,6 +7,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/antchfx/htmlquery"
 	"github.com/gocolly/colly/v2"
@@ -67,6 +69,16 @@ func simplifyGenre(genre string) string {
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
+
+	cookieCloudMu          sync.Mutex
+	cookieCloud            *cookieCloudClient
+	cookieCloudProxy       string
+	cookieCloudHTTPClient  *http.Client
+	cookieCloudTimeout     time.Duration
+	cookieCloudLastAttempt time.Time
+	cookieCloudLastSuccess time.Time
+	cookieCloudLoaded      bool
+	cookieCloudLastError   error
 }
 
 func New() *JavDB {
@@ -83,6 +95,189 @@ func New() *JavDB {
 				{Name: "locale", Value: "zh-CN"},
 			})),
 	}
+}
+
+// SetProxy applies the provider proxy to the JavDB scraper and remembers it
+// for the CookieCloud client. CookieCloud must use the same egress as JavDB so
+// browser session cookies (including anti-bot cookies) remain valid.
+func (jdb *JavDB) SetProxy(proxyURL string) error {
+	if err := jdb.Scraper.SetProxy(proxyURL); err != nil {
+		return err
+	}
+	jdb.cookieCloudMu.Lock()
+	jdb.cookieCloudProxy = proxyURL
+	jdb.cookieCloudHTTPClient = nil
+	jdb.cookieCloudMu.Unlock()
+	return nil
+}
+
+// SetRequestTimeout keeps CookieCloud refreshes from outliving the provider's
+// request timeout.
+func (jdb *JavDB) SetRequestTimeout(timeout time.Duration) {
+	jdb.Scraper.SetRequestTimeout(timeout)
+	jdb.cookieCloudMu.Lock()
+	jdb.cookieCloudTimeout = timeout
+	jdb.cookieCloudHTTPClient = nil
+	jdb.cookieCloudMu.Unlock()
+}
+
+// SetCookies applies a synchronized session to both page scraping and resource
+// fetching. The explicit method also resolves the two embedded helper methods
+// with the same name for callers that need to add cookies manually.
+func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
+	if err := jdb.Scraper.SetCookies(rawURL, cookies); err != nil {
+		return err
+	}
+	return jdb.Fetcher.SetCookies(rawURL, cookies)
+}
+
+// SetConfig enables optional CookieCloud browser-session synchronization.
+// Environment variables are exposed through the standard provider config:
+//
+//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_HOST
+//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_UUID
+//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD
+//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL (optional)
+//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional)
+//
+// The cookie refresh is lazy and cached for ten minutes by default, so service
+// startup does not depend on CookieCloud availability.
+func (jdb *JavDB) SetConfig(config provider.Config) error {
+	if config == nil {
+		return nil
+	}
+	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
+	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")
+	password, passwordSet := configValue(config, "cookiecloud_password", "cookie_cloud_password")
+	if !hostSet && !uuidSet && !passwordSet {
+		return nil
+	}
+	if host == "" || uuid == "" || password == "" {
+		return fmt.Errorf("JavDB CookieCloud requires host, uuid and password")
+	}
+	parsedHost, err := url.Parse(host)
+	if err != nil || parsedHost.Host == "" ||
+		(parsedHost.Scheme != "http" && parsedHost.Scheme != "https") {
+		return fmt.Errorf("invalid JavDB CookieCloud host")
+	}
+	refreshInterval := defaultCookieCloudRefreshInterval
+	if value, ok := configValue(config, "cookiecloud_refresh_interval", "cookie_cloud_refresh_interval"); ok && value != "" {
+		refreshInterval, err = time.ParseDuration(value)
+		if err != nil || refreshInterval < time.Second {
+			return fmt.Errorf("invalid JavDB CookieCloud refresh interval")
+		}
+	}
+	if value, ok := configValue(config, "cookiecloud_user_agent", "cookie_cloud_user_agent"); ok && value != "" {
+		jdb.Scraper.SetUserAgent(value)
+	}
+
+	jdb.cookieCloudMu.Lock()
+	jdb.cookieCloud = &cookieCloudClient{
+		host:            strings.TrimRight(host, "/"),
+		uuid:            uuid,
+		password:        password,
+		refreshInterval: refreshInterval,
+	}
+	jdb.cookieCloudLastAttempt = time.Time{}
+	jdb.cookieCloudLastSuccess = time.Time{}
+	jdb.cookieCloudLoaded = false
+	jdb.cookieCloudLastError = nil
+	jdb.cookieCloudHTTPClient = nil
+	jdb.cookieCloudMu.Unlock()
+	return nil
+}
+
+func configValue(config provider.Config, keys ...string) (string, bool) {
+	for _, key := range keys {
+		if !config.Has(key) {
+			continue
+		}
+		value, err := config.GetString(key)
+		if err != nil {
+			return "", true
+		}
+		return strings.TrimSpace(value), true
+	}
+	return "", false
+}
+
+func (jdb *JavDB) cookieCloudHTTPClientLocked() *http.Client {
+	if jdb.cookieCloudHTTPClient != nil {
+		return jdb.cookieCloudHTTPClient
+	}
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		transport = transport.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	if jdb.cookieCloudProxy != "" {
+		if proxyURL, err := url.Parse(jdb.cookieCloudProxy); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	} else {
+		transport.Proxy = http.ProxyFromEnvironment
+	}
+	timeout := jdb.cookieCloudTimeout
+	if timeout < time.Second {
+		timeout = time.Minute
+	}
+	jdb.cookieCloudHTTPClient = &http.Client{Transport: transport, Timeout: timeout}
+	return jdb.cookieCloudHTTPClient
+}
+
+// ensureCookieCloudCookies refreshes the CookieCloud session lazily. A
+// previously loaded session is retained when a later refresh temporarily
+// fails, avoiding an unnecessary fallback to anonymous JavDB requests.
+func (jdb *JavDB) ensureCookieCloudCookies() error {
+	jdb.cookieCloudMu.Lock()
+	defer jdb.cookieCloudMu.Unlock()
+	if jdb.cookieCloud == nil {
+		return nil
+	}
+	now := time.Now()
+	if jdb.cookieCloudLoaded && now.Sub(jdb.cookieCloudLastSuccess) < jdb.cookieCloud.refreshInterval {
+		return nil
+	}
+	if !jdb.cookieCloudLastAttempt.IsZero() && now.Sub(jdb.cookieCloudLastAttempt) < time.Minute {
+		if jdb.cookieCloudLoaded {
+			return nil
+		}
+		return jdb.cookieCloudLastError
+	}
+	jdb.cookieCloudLastAttempt = now
+	jdb.cookieCloud.httpClient = jdb.cookieCloudHTTPClientLocked()
+	cookies, err := jdb.cookieCloud.fetchCookies()
+	if err != nil {
+		jdb.cookieCloudLastError = err
+		if jdb.cookieCloudLoaded {
+			return nil
+		}
+		return err
+	}
+	if len(cookies) == 0 {
+		err = fmt.Errorf("CookieCloud contains no JavDB cookies")
+		jdb.cookieCloudLastError = err
+		return err
+	}
+	for _, cookie := range cookies {
+		domain := strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
+		if domain == "" {
+			domain = "javdb.com"
+		}
+		cookieURL := "https://" + domain + "/"
+		if err = jdb.SetCookies(cookieURL, []*http.Cookie{cookie}); err != nil {
+			jdb.cookieCloudLastError = fmt.Errorf("apply CookieCloud cookies: %w", err)
+			if jdb.cookieCloudLoaded {
+				return nil
+			}
+			return jdb.cookieCloudLastError
+		}
+	}
+	jdb.cookieCloudLoaded = true
+	jdb.cookieCloudLastSuccess = now
+	jdb.cookieCloudLastError = nil
+	return nil
 }
 
 // JavDB uses a case-sensitive opaque ID in /v/<id> URLs.
@@ -106,6 +301,9 @@ func (jdb *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 }
 
 func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err error) {
+	if err = jdb.ensureCookieCloudCookies(); err != nil {
+		return nil, err
+	}
 	id, err := jdb.ParseMovieIDFromURL(rawURL)
 	if err != nil {
 		return nil, err
@@ -191,6 +389,9 @@ func (jdb *JavDB) NormalizeMovieKeyword(keyword string) string {
 }
 
 func (jdb *JavDB) SearchMovie(keyword string) (results []*model.MovieSearchResult, err error) {
+	if err = jdb.ensureCookieCloudCookies(); err != nil {
+		return nil, err
+	}
 	c := jdb.ClonedCollector()
 	c.OnXML(`//div[contains(@class,"movie-list")]//div[contains(@class,"item")]/a[contains(@class,"box")]`, func(e *colly.XMLElement) {
 		homepage := e.Request.AbsoluteURL(e.Attr("href"))

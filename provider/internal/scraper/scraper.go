@@ -1,6 +1,7 @@
 package scraper
 
 import (
+	"net/http"
 	"net/url"
 	"time"
 
@@ -80,6 +81,18 @@ func (s *Scraper) ClonedCollector() *colly.Collector { return s.c.Clone() }
 
 // SetProxy sets http or socks5 proxy for HTTP requests.
 func (s *Scraper) SetProxy(proxyURL string) error { return s.c.SetProxy(proxyURL) }
+
+// SetCookies adds cookies to the collector's cookie jar. Providers that
+// refresh browser sessions at runtime can use this method before cloning a
+// collector for a request.
+func (s *Scraper) SetCookies(rawURL string, cookies []*http.Cookie) error {
+	return s.c.SetCookies(rawURL, cookies)
+}
+
+// SetUserAgent overrides the collector's User-Agent header.
+func (s *Scraper) SetUserAgent(userAgent string) {
+	s.c.UserAgent = userAgent
+}
 
 // SetRequestTimeout sets timeout for HTTP requests.
 func (s *Scraper) SetRequestTimeout(timeout time.Duration) { s.c.SetRequestTimeout(timeout) }

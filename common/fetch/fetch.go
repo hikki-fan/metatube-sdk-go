@@ -2,9 +2,11 @@ package fetch
 
 import (
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"time"
 
 	"github.com/hashicorp/go-cleanhttp"
@@ -101,6 +103,27 @@ func Default(cfg *Config) *Fetcher {
 
 func (f *Fetcher) Fetch(url string) (resp *http.Response, err error) {
 	return f.Get(url)
+}
+
+// SetCookies adds cookies to the fetcher's jar, creating a jar on demand for
+// fetchers that were initialized without cookie support. Providers that sync a
+// browser session can call this before fetching protected images or pages.
+func (f *Fetcher) SetCookies(rawURL string, cookies []*http.Cookie) error {
+	if f == nil || f.client == nil {
+		return fmt.Errorf("fetcher is not initialized")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid cookie URL")
+	}
+	if f.client.Jar == nil {
+		f.client.Jar, err = cookiejar.New(nil)
+		if err != nil {
+			return fmt.Errorf("create cookie jar: %w", err)
+		}
+	}
+	f.client.Jar.SetCookies(u, cookies)
+	return nil
 }
 
 func (f *Fetcher) Get(url string, opts ...Option) (resp *http.Response, err error) {

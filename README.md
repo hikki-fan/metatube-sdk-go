@@ -45,6 +45,25 @@ the below Go command to install SDK.
 go get -u github.com/metatube-community/metatube-sdk-go
 ```
 
+### JavDB CookieCloud session (optional)
+
+JavDB can lazily synchronize browser cookies from a CookieCloud server before
+searching or loading a detail page. Configure all three required variables on
+the MetaTube server; the refresh interval defaults to ten minutes.
+
+```sh
+MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_HOST=https://cookiecloud.example.com
+MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_UUID=<cookiecloud-uuid>
+MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD=<cookiecloud-end-to-end-password>
+# Optional:
+MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL=10m
+MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT=<browser-user-agent>
+```
+
+Only cookies whose domains are `javdb.com` (or its subdomains) and
+`jdbstatic.com` (or its subdomains) are imported. Credentials stay in memory
+and are never logged or persisted by the SDK.
+
 ## Credits
 
 | Library														                                           | Description																						                                                                    |
