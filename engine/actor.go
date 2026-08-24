@@ -171,6 +171,13 @@ func (e *Engine) getActorInfoWithCallback(provider mt.ActorProvider, id string, 
 	// Query DB first (by id).
 	if lazy {
 		if info, err = e.getActorInfoFromDB(provider, id); err == nil && info.IsValid() {
+			if e.enrichActorInfo(info, false) {
+				// Keep the primary provider identity and persist only the merged
+				// actor fields. Gfriends image injection remains response-only.
+				e.db.Clauses(clause.OnConflict{
+					UpdateAll: true,
+				}).Create(info) // ignore error
+			}
 			return
 		}
 	}
@@ -183,7 +190,14 @@ func (e *Engine) getActorInfoWithCallback(provider mt.ActorProvider, id string, 
 			}).Create(info) // ignore error
 		}
 	}()
-	return callback()
+	info, err = callback()
+	if err == nil {
+		// A forced/fresh fetch always retries the supplement provider. This is
+		// what makes a metadata refresh pick up newly available JavDB aliases
+		// or images.
+		e.enrichActorInfo(info, true)
+	}
+	return
 }
 
 func (e *Engine) getActorInfoByProviderID(provider mt.ActorProvider, id string, lazy bool) (*model.ActorInfo, error) {

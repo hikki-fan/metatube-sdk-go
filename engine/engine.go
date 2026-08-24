@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -42,6 +43,12 @@ type Engine struct {
 	// E.g., github.com -> [Gfriends, ...]
 	actorHostProviders *maps.CaseInsensitiveMap[[]mt.ActorProvider]
 	movieHostProviders *maps.CaseInsensitiveMap[[]mt.MovieProvider]
+
+	// actorEnrichmentAttempts prevents a cached actor lookup from issuing a
+	// JavDB request on every request while still allowing forced refreshes to
+	// retry immediately.
+	actorEnrichmentMu       sync.Mutex
+	actorEnrichmentAttempts map[string]time.Time
 }
 
 func New(db *gorm.DB, opts ...Option) *Engine {
@@ -50,12 +57,13 @@ func New(db *gorm.DB, opts ...Option) *Engine {
 		name:    DefaultEngineName,
 		timeout: DefaultRequestTimeout,
 		// pre-initialize case-insensitive maps.
-		actorProviderConfigs: maps.NewCaseInsensitiveMap[mt.Config](),
-		movieProviderConfigs: maps.NewCaseInsensitiveMap[mt.Config](),
-		actorProviders:       maps.NewCaseInsensitiveMap[mt.ActorProvider](),
-		movieProviders:       maps.NewCaseInsensitiveMap[mt.MovieProvider](),
-		actorHostProviders:   maps.NewCaseInsensitiveMap[[]mt.ActorProvider](),
-		movieHostProviders:   maps.NewCaseInsensitiveMap[[]mt.MovieProvider](),
+		actorProviderConfigs:    maps.NewCaseInsensitiveMap[mt.Config](),
+		movieProviderConfigs:    maps.NewCaseInsensitiveMap[mt.Config](),
+		actorProviders:          maps.NewCaseInsensitiveMap[mt.ActorProvider](),
+		movieProviders:          maps.NewCaseInsensitiveMap[mt.MovieProvider](),
+		actorHostProviders:      maps.NewCaseInsensitiveMap[[]mt.ActorProvider](),
+		movieHostProviders:      maps.NewCaseInsensitiveMap[[]mt.MovieProvider](),
+		actorEnrichmentAttempts: make(map[string]time.Time),
 	}
 	// apply options.
 	for _, opt := range opts {

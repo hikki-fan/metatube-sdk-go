@@ -64,6 +64,31 @@ Only cookies whose domains are `javdb.com` (or its subdomains) and
 `jdbstatic.com` (or its subdomains) are imported. Credentials stay in memory
 and are never logged or persisted by the SDK.
 
+### AV-LEAGUE actor enrichment
+
+AV-LEAGUE is the primary Japanese JAV actor provider. When an AV-LEAGUE
+actor is fetched, MetaTube performs a strict, unique-name/alias match against
+`JavDBActor` and appends only the JavDB name, aliases, and avatar. The
+AV-LEAGUE provider ID, homepage, and structured profile fields remain the
+source of truth. JavDB errors and ambiguous matches are ignored so the
+primary metadata is not lost.
+
+The actor provider can use the same optional CookieCloud session with the
+following variables:
+
+```sh
+MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_HOST=https://cookiecloud.example.com
+MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_UUID=<cookiecloud-uuid>
+MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_PASSWORD=<cookiecloud-end-to-end-password>
+# Optional:
+MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_REFRESH_INTERVAL=10m
+MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_USER_AGENT=<browser-user-agent>
+```
+
+Cached actor records are enriched once per process within the retry window;
+use a forced metadata refresh after enabling this feature to update existing
+records immediately.
+
 ## Credits
 
 | Library														                                           | Description																						                                                                    |
