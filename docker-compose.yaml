@@ -1,6 +1,6 @@
 services:
   metatube:
-    image: metatube-server:v1.4.1-javdb.3
+    image: metatube-server:v1.4.1-javdb.4
     container_name: metatube
     ports:
       - "8080:8080"

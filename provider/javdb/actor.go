@@ -280,7 +280,7 @@ func (jdb *JavDBActor) GetActorInfoByURL(rawURL string) (info *model.ActorInfo, 
 			return
 		}
 		if domNode, ok := e.DOM.(*html.Node); ok {
-			if name := extractActorName(domNode); name != "" {
+			if name := cleanActorSearchName(extractActorName(domNode)); name != "" {
 				info.Name = name
 			}
 		}
@@ -288,7 +288,7 @@ func (jdb *JavDBActor) GetActorInfoByURL(rawURL string) (info *model.ActorInfo, 
 	c.OnXML(`//span[contains(@class,"actor-section-name")] | //span[contains(@class,"section-name")]`, func(e *colly.XMLElement) {
 		if info.Name == "" {
 			if domNode, ok := e.DOM.(*html.Node); ok {
-				info.Name = extractActorName(domNode)
+				info.Name = cleanActorSearchName(extractActorName(domNode))
 			}
 		}
 	})
@@ -423,7 +423,7 @@ func (jdb *JavDBActor) SearchActor(keyword string) (results []*model.ActorSearch
 
 		var name string
 		if domNode, ok := e.DOM.(*html.Node); ok {
-			name = extractActorName(domNode)
+			name = cleanActorSearchName(extractActorName(domNode))
 		}
 		if name == "" {
 			name = strings.TrimSpace(e.ChildText(`.//strong[contains(@class,"name")] | .//span[contains(@class,"name")] | .//strong[1]`))
@@ -556,10 +556,18 @@ func parseActorMeasurements(s string, existingCup string) (measurements string, 
 func cleanActorSearchName(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.Trim(s, " \t\n\r,♀♂")
+	for {
+		cleaned := actorMovieCountSuffixRE.ReplaceAllString(s, "")
+		if cleaned == s {
+			break
+		}
+		s = strings.TrimSpace(cleaned)
+	}
 	return strings.TrimSpace(s)
 }
 
 var actorImageURLRE = regexp.MustCompile(`(?i)url\(\s*["']?([^"')]+)["']?\s*\)`)
+var actorMovieCountSuffixRE = regexp.MustCompile(`(?i)\s*\d+\s*(?:部影片|部片|部作品|videos?)\s*$`)
 
 func extractActorImageSrc(e *colly.XMLElement) string {
 	if image := extractImageSrc(e, `.//img[1]`); image != "" {

@@ -197,7 +197,7 @@ func TestJavDBActor_GetActorInfoByURL_ActualLayout(t *testing.T) {
 <html><body>
   <div class="actor-section">
     <span class="avatar" style="background-image: url('https://c0.jdbstatic.com/avatars/ev/EvkJ.jpg')"></span>
-    <span class="actor-section-name">河北彩花</span>
+    <span class="actor-section-name">河北彩花 218 部影片</span>
     <span class="section-meta">河北樱花</span>
     <span class="section-meta">218 部影片</span>
   </div>
