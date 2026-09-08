@@ -43,6 +43,32 @@ const (
 	searchURL = "https://javdb.com/search?f=all&q=%s"
 )
 
+func parseWesternSearchInterval(value string) (time.Duration, time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, 0, fmt.Errorf("empty interval")
+	}
+
+	parts := strings.SplitN(value, "-", 2)
+	if len(parts) == 1 {
+		interval, err := time.ParseDuration(strings.TrimSpace(parts[0]))
+		if err != nil || interval < 0 {
+			return 0, 0, fmt.Errorf("invalid interval")
+		}
+		return interval, interval, nil
+	}
+
+	minInterval, err := time.ParseDuration(strings.TrimSpace(parts[0]))
+	if err != nil || minInterval < 0 {
+		return 0, 0, fmt.Errorf("invalid minimum interval")
+	}
+	maxInterval, err := time.ParseDuration(strings.TrimSpace(parts[1]))
+	if err != nil || maxInterval < minInterval {
+		return 0, 0, fmt.Errorf("invalid maximum interval")
+	}
+	return minInterval, maxInterval, nil
+}
+
 var (
 	scorePattern = regexp.MustCompile(`\d+(?:\.\d+)?`)
 
@@ -98,7 +124,10 @@ func New() *JavDB {
 			scraper.WithCookies(baseURL, []*http.Cookie{
 				{Name: "locale", Value: "zh-CN"},
 			})),
-		westernSearchLimiter: NewWesternSearchLimiter(DefaultWesternSearchInterval),
+		westernSearchLimiter: NewRandomWesternSearchLimiter(
+			DefaultWesternSearchMinInterval,
+			DefaultWesternSearchMaxInterval,
+		),
 	}
 }
 
@@ -106,7 +135,10 @@ func (jdb *JavDB) getWesternLimiter() *WesternSearchLimiter {
 	jdb.westernLimiterMu.Lock()
 	defer jdb.westernLimiterMu.Unlock()
 	if jdb.westernSearchLimiter == nil {
-		jdb.westernSearchLimiter = NewWesternSearchLimiter(DefaultWesternSearchInterval)
+		jdb.westernSearchLimiter = NewRandomWesternSearchLimiter(
+			DefaultWesternSearchMinInterval,
+			DefaultWesternSearchMaxInterval,
+		)
 	}
 	return jdb.westernSearchLimiter
 }
@@ -165,7 +197,8 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL (optional)
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional)
-//	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, default 10s)
+//	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, a duration or
+//		a range such as 10s-25s; default 10s-25s)
 //
 // The cookie refresh is lazy and cached for ten minutes by default, so service
 // startup does not depend on CookieCloud availability.
@@ -174,11 +207,11 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 		return nil
 	}
 	if value, ok := configValue(config, "javdb_western_search_interval", "western_search_interval"); ok && value != "" {
-		interval, err := time.ParseDuration(value)
-		if err != nil || interval < 0 {
+		minInterval, maxInterval, err := parseWesternSearchInterval(value)
+		if err != nil {
 			return fmt.Errorf("invalid JavDB Western search interval")
 		}
-		jdb.SetWesternSearchInterval(interval)
+		jdb.getWesternLimiter().SetIntervalRange(minInterval, maxInterval)
 	}
 	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
 	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")

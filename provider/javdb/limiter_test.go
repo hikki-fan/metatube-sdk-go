@@ -85,9 +85,15 @@ func TestWesternSearchLimiter_SimulatedClock(t *testing.T) {
 func TestWesternSearchLimiter_IntervalOverride(t *testing.T) {
 	jdb := New()
 	assert.Equal(t, DefaultWesternSearchInterval, jdb.getWesternLimiter().Interval())
+	minInterval, maxInterval := jdb.getWesternLimiter().IntervalRange()
+	assert.Equal(t, DefaultWesternSearchMinInterval, minInterval)
+	assert.Equal(t, DefaultWesternSearchMaxInterval, maxInterval)
 
 	jdb.SetWesternSearchInterval(10 * time.Millisecond)
 	assert.Equal(t, 10*time.Millisecond, jdb.getWesternLimiter().Interval())
+	minInterval, maxInterval = jdb.getWesternLimiter().IntervalRange()
+	assert.Equal(t, 10*time.Millisecond, minInterval)
+	assert.Equal(t, 10*time.Millisecond, maxInterval)
 
 	customLimiter := NewWesternSearchLimiter(5 * time.Millisecond)
 	jdb.SetWesternSearchLimiter(customLimiter)
@@ -105,9 +111,66 @@ func TestWesternSearchLimiter_ConfigOverride(t *testing.T) {
 	err := jdb.SetConfig(newLimiterConfig("12ms"))
 	assert.NoError(t, err)
 	assert.Equal(t, 12*time.Millisecond, jdb.getWesternLimiter().Interval())
+	minInterval, maxInterval := jdb.getWesternLimiter().IntervalRange()
+	assert.Equal(t, 12*time.Millisecond, minInterval)
+	assert.Equal(t, 12*time.Millisecond, maxInterval)
+
+	err = jdb.SetConfig(newLimiterConfig("10s-25s"))
+	assert.NoError(t, err)
+	minInterval, maxInterval = jdb.getWesternLimiter().IntervalRange()
+	assert.Equal(t, 10*time.Second, minInterval)
+	assert.Equal(t, 25*time.Second, maxInterval)
 
 	err = jdb.SetConfig(newLimiterConfig("not-a-duration"))
 	assert.Error(t, err)
+}
+
+func TestParseWesternSearchInterval(t *testing.T) {
+	tests := []struct {
+		value       string
+		minInterval time.Duration
+		maxInterval time.Duration
+		wantErr     bool
+	}{
+		{value: "10s", minInterval: 10 * time.Second, maxInterval: 10 * time.Second},
+		{value: " 10s - 25s ", minInterval: 10 * time.Second, maxInterval: 25 * time.Second},
+		{value: "25s-10s", wantErr: true},
+		{value: "-1s-10s", wantErr: true},
+		{value: "not-a-duration", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		minInterval, maxInterval, err := parseWesternSearchInterval(tc.value)
+		if tc.wantErr {
+			assert.Error(t, err, tc.value)
+			continue
+		}
+		assert.NoError(t, err, tc.value)
+		assert.Equal(t, tc.minInterval, minInterval, tc.value)
+		assert.Equal(t, tc.maxInterval, maxInterval, tc.value)
+	}
+}
+
+func TestWesternSearchLimiter_RandomRange(t *testing.T) {
+	currentTime := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	limiter := NewRandomWesternSearchLimiter(10*time.Second, 25*time.Second)
+	limiter.now = func() time.Time { return currentTime }
+	var slept time.Duration
+	limiter.sleep = func(d time.Duration) {
+		slept += d
+		currentTime = currentTime.Add(d)
+	}
+
+	// Select the lower bound, then the upper bound, to verify the inclusive
+	// range without making the test depend on the random seed.
+	limiter.randomInt63n = func(n int64) int64 { return 0 }
+	limiter.Wait()
+	limiter.Wait()
+	assert.Equal(t, 10*time.Second, slept)
+
+	limiter.randomInt63n = func(n int64) int64 { return n - 1 }
+	limiter.Wait()
+	assert.Equal(t, 35*time.Second, slept)
 }
 
 func TestWesternSearchLimiter_ZeroInterval(t *testing.T) {
