@@ -17,6 +17,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/metatube-community/metatube-sdk-go/common/fetch"
+	"github.com/metatube-community/metatube-sdk-go/common/number"
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
 	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider"
@@ -70,6 +71,9 @@ type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
 
+	westernLimiterMu     sync.Mutex
+	westernSearchLimiter *WesternSearchLimiter
+
 	cookieCloudMu          sync.Mutex
 	cookieCloud            *cookieCloudClient
 	cookieCloudProxy       string
@@ -94,7 +98,29 @@ func New() *JavDB {
 			scraper.WithCookies(baseURL, []*http.Cookie{
 				{Name: "locale", Value: "zh-CN"},
 			})),
+		westernSearchLimiter: NewWesternSearchLimiter(DefaultWesternSearchInterval),
 	}
+}
+
+func (jdb *JavDB) getWesternLimiter() *WesternSearchLimiter {
+	jdb.westernLimiterMu.Lock()
+	defer jdb.westernLimiterMu.Unlock()
+	if jdb.westernSearchLimiter == nil {
+		jdb.westernSearchLimiter = NewWesternSearchLimiter(DefaultWesternSearchInterval)
+	}
+	return jdb.westernSearchLimiter
+}
+
+// SetWesternSearchLimiter replaces the Western scene search limiter.
+func (jdb *JavDB) SetWesternSearchLimiter(limiter *WesternSearchLimiter) {
+	jdb.westernLimiterMu.Lock()
+	defer jdb.westernLimiterMu.Unlock()
+	jdb.westernSearchLimiter = limiter
+}
+
+// SetWesternSearchInterval configures the interval between Western scene searches.
+func (jdb *JavDB) SetWesternSearchInterval(interval time.Duration) {
+	jdb.getWesternLimiter().SetInterval(interval)
 }
 
 // SetProxy applies the provider proxy to the JavDB scraper and remembers it
@@ -139,12 +165,20 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL (optional)
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional)
+//	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, default 10s)
 //
 // The cookie refresh is lazy and cached for ten minutes by default, so service
 // startup does not depend on CookieCloud availability.
 func (jdb *JavDB) SetConfig(config provider.Config) error {
 	if config == nil {
 		return nil
+	}
+	if value, ok := configValue(config, "javdb_western_search_interval", "western_search_interval"); ok && value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil || interval < 0 {
+			return fmt.Errorf("invalid JavDB Western search interval")
+		}
+		jdb.SetWesternSearchInterval(interval)
 	}
 	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
 	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")
@@ -389,6 +423,9 @@ func (jdb *JavDB) NormalizeMovieKeyword(keyword string) string {
 }
 
 func (jdb *JavDB) SearchMovie(keyword string) (results []*model.MovieSearchResult, err error) {
+	if number.IsWestern(keyword) {
+		jdb.getWesternLimiter().Wait()
+	}
 	if err = jdb.ensureCookieCloudCookies(); err != nil {
 		return nil, err
 	}

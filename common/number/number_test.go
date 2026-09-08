@@ -193,8 +193,62 @@ func TestTrim(t *testing.T) {
 		{"hhd800.com@midv00905hhb1", "midv00905"},
 		{"hhd800.com@1fcdss00072hhb2", "1fcdss00072"},
 		{"hhd800.com@jums00150hhb", "jums00150"},
+		{"BrazzersExxtras.24.01.15", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15.mp4", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15.mp4.strm", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15-C.mp4", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15-C.mp4.strm", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15-UC.mp4", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15-C", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15-UC", "BrazzersExxtras.24.01.15"},
+		{"brazzersexxtras.24.01.15-uc.mkv", "brazzersexxtras.24.01.15"},
+		{"Twistys.23.11.05", "Twistys.23.11.05"},
+		{"Twistys.23.11.05.avi", "Twistys.23.11.05"},
+		{"Twistys.23.11.05_C", "Twistys.23.11.05"},
+		{"Twistys.23.11.05_UC.mp4", "Twistys.23.11.05"},
+		{"Tushy.22.03.14-c", "Tushy.22.03.14"},
+		{"Tushy.22.03.14-uc.mkv", "Tushy.22.03.14"},
+		{"Sweet-Sinner.24.01.15", "Sweet-Sinner.24.01.15"},
+		{"[Group] BrazzersExxtras.24.01.15-C.mp4", "BrazzersExxtras.24.01.15"},
+		{"BrazzersExxtras.24.01.15.Gianna.Dior.1080p.mp4", "BrazzersExxtras.24.01.15"},
+		{"GANA-1928", "GANA-1928"},
+		{"GANA-1928.mp4", "GANA-1928"},
+		{"MGMJ-070", "MGMJ-070"},
+		{"MGMJ-070.mkv", "MGMJ-070"},
 	} {
 		assert.Equal(t, unit.want, Trim(unit.orig), unit.orig)
+	}
+}
+
+func TestIsWestern(t *testing.T) {
+	for _, unit := range []struct {
+		orig string
+		want bool
+	}{
+		{"BrazzersExxtras.24.01.15", true},
+		{"BrazzersExxtras.24.01.15-C", true},
+		{"BrazzersExxtras.24.01.15-UC", true},
+		{"BrazzersExxtras.24.01.15_c", true},
+		{"BrazzersExxtras.24.01.15_uc", true},
+		{"brazzersexxtras.24.01.15", true},
+		{"Twistys.23.11.05", true},
+		{"Tushy.22.03.14", true},
+		{"Sweet-Sinner.24.01.15", true},
+		{"21Sextury.20.05.10", true},
+		{"GANA-1928", false},
+		{"MGMJ-070", false},
+		{"FC2-123456", false},
+		{"FC2-PPV-123456", false},
+		{"ABP-030", false},
+		{"ABP-030-C", false},
+		{"ssis00123", false},
+		{"1080p", false},
+		{"192.168.50.100", false},
+		{"Studio.24.13.15", false},
+		{"Studio.24.01.32", false},
+		{"", false},
+	} {
+		assert.Equal(t, unit.want, IsWestern(unit.orig), unit.orig)
 	}
 }
 

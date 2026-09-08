@@ -6,14 +6,31 @@ import (
 	"strings"
 )
 
+var (
+	westernSceneRe = regexp.MustCompile(`(?i)\b([a-z\d]*[a-z][a-z\d]*(?:[-_][a-z\d]+)*\.\d{2}\.(?:0[1-9]|1[0-2])\.(?:0[1-9]|[12]\d|3[01])(?:[-_](?:c|uc))?)\b`)
+	westernExtRe   = regexp.MustCompile(`(?i)^\.\d{2}(?:[-_](?:c|uc))?$`)
+	westernExactRe = regexp.MustCompile(`(?i)^[a-z\d]*[a-z][a-z\d]*(?:[-_][a-z\d]+)*\.\d{2}\.(?:0[1-9]|1[0-2])\.(?:0[1-9]|[12]\d|3[01])(?:[-_](?:c|uc))?$`)
+)
+
+func isWesternExt(s, ext string) bool {
+	return westernExtRe.MatchString(ext) && westernSceneRe.MatchString(s)
+}
+
+// IsWestern returns true if the number belongs to a Western adult scene (Studio.YY.MM.DD).
+func IsWestern(s string) bool {
+	return westernExactRe.MatchString(strings.TrimSpace(s))
+}
+
 func Trim(s string) string {
 	const maxExtLength = 7
-	if ext := path.Ext(s); len(ext) < maxExtLength {
+	if ext := path.Ext(s); len(ext) < maxExtLength && !isWesternExt(s, ext) {
 		s = s[:len(s)-len(ext)] // trim extension
 	}
 	s = regexp.MustCompile(`(?i)([a-z\d]+\.(?:com|net|top|xyz|tv))(?:[^a-z\d]|$)`).
 		ReplaceAllString(s, "") // trim domain
-	if ss := regexp.MustCompile(`(?i)([a-z\d]+(?:[-_][a-z\d]{2,})+)`).FindStringSubmatch(s); len(ss) > 0 {
+	if ss := westernSceneRe.FindStringSubmatch(s); len(ss) > 0 {
+		s = ss[1] // preserve dotted Western scene format Studio.YY.MM.DD(-C/-UC)
+	} else if ss := regexp.MustCompile(`(?i)([a-z\d]+(?:[-_][a-z\d]{2,})+)`).FindStringSubmatch(s); len(ss) > 0 {
 		s = ss[1] // first find number with dashes
 	} else if ss = regexp.MustCompile(`(?i)((?:[a-z]+\d|\d+[a-z])[a-z\d]+)`).FindStringSubmatch(s); len(ss) > 1 {
 		s = ss[1] // otherwise find number with alphas & digits
