@@ -25,6 +25,10 @@ type Config struct {
 	// Set Referer Header.
 	Referer string
 
+	// Headers contains default headers applied to every request. Explicit
+	// request options still take precedence over these defaults.
+	Headers map[string]string
+
 	// Enable cookies.
 	EnableCookies bool
 
@@ -126,6 +130,44 @@ func (f *Fetcher) SetCookies(rawURL string, cookies []*http.Cookie) error {
 	return nil
 }
 
+// SetUserAgent overrides the default User-Agent used by future requests.
+func (f *Fetcher) SetUserAgent(userAgent string) {
+	if f == nil || f.config == nil {
+		return
+	}
+	f.config.UserAgent = userAgent
+	f.config.RandomUserAgent = false
+}
+
+// SetReferer overrides the default Referer used by future requests.
+func (f *Fetcher) SetReferer(referer string) {
+	if f == nil || f.config == nil {
+		return
+	}
+	f.config.Referer = referer
+}
+
+// SetHeaders replaces the default headers used by future requests.
+func (f *Fetcher) SetHeaders(headers map[string]string) {
+	if f == nil || f.config == nil {
+		return
+	}
+	f.config.Headers = make(map[string]string, len(headers))
+	for key, value := range headers {
+		f.config.Headers[key] = value
+	}
+}
+
+// SetTransport replaces the underlying RoundTripper, keeping the cookie jar
+// and timeout. Providers that impersonate a browser TLS fingerprint can share
+// one transport with the scraper.
+func (f *Fetcher) SetTransport(rt http.RoundTripper) {
+	if f == nil || f.client == nil || rt == nil {
+		return
+	}
+	f.client.Transport = rt
+}
+
 func (f *Fetcher) Get(url string, opts ...Option) (resp *http.Response, err error) {
 	return f.Request(http.MethodGet, url, nil, opts...)
 }
@@ -145,6 +187,9 @@ func (f *Fetcher) Request(method, url string, body io.Reader, opts ...Option) (r
 	}
 	// compose options.
 	var options []Option
+	if len(c.Headers) > 0 {
+		options = append(options, WithHeaders(c.Headers))
+	}
 	if c.UserAgent != "" {
 		options = append(options, WithUserAgent(c.UserAgent))
 	}

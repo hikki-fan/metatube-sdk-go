@@ -14,6 +14,7 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/text/language"
 
+	"github.com/metatube-community/metatube-sdk-go/common/chrometransport"
 	"github.com/metatube-community/metatube-sdk-go/common/fetch"
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
 	"github.com/metatube-community/metatube-sdk-go/model"
@@ -55,29 +56,49 @@ type JavDBActor struct {
 	cookieCloudLastSuccess time.Time
 	cookieCloudLoaded      bool
 	cookieCloudLastError   error
+
+	browserTransport *chrometransport.Transport
 }
 
 func NewActor() *JavDBActor {
+	fetchCfg := &fetch.Config{
+		UserAgent: defaultJavDBUserAgent,
+		Referer:   actorBaseURL,
+		Headers:   javDBImageHeaders(actorBaseURL),
+	}
+	scraperOpts := []scraper.Option{
+		scraper.WithUserAgent(defaultJavDBUserAgent),
+		scraper.WithHeaders(javDBDocumentHeaders(actorBaseURL)),
+		scraper.WithCookies(actorBaseURL, []*http.Cookie{
+			{Name: "locale", Value: "zh-CN"},
+		}),
+	}
+	browserTransport, _ := chrometransport.New()
+	if browserTransport != nil {
+		fetchCfg.Transport = browserTransport
+		scraperOpts = append(scraperOpts, scraper.WithTransport(browserTransport))
+	}
 	return &JavDBActor{
-		Fetcher: fetch.Default(&fetch.Config{Referer: actorBaseURL}),
+		Fetcher: fetch.Default(fetchCfg),
 		Scraper: scraper.NewDefaultScraper(
 			ActorProviderName, actorBaseURL, ActorPriority,
 			language.Japanese,
-			scraper.WithHeaders(map[string]string{
-				"Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
-				"Referer":         actorBaseURL,
-			}),
-			scraper.WithCookies(actorBaseURL, []*http.Cookie{
-				{Name: "locale", Value: "zh-CN"},
-			})),
-		searchEndpoint: actorSearchURL,
-		pageEndpoint:   actorPageURL,
+			scraperOpts...),
+		searchEndpoint:   actorSearchURL,
+		pageEndpoint:     actorPageURL,
+		browserTransport: browserTransport,
 	}
 }
 
-// SetProxy applies the provider proxy to the scraper and CookieCloud.
+// SetProxy applies the provider proxy to JavDBActor page/image requests and
+// CookieCloud. Chrome TLS impersonation is updated in place so colly does not
+// replace the transport with a plain Go client.
 func (jdb *JavDBActor) SetProxy(proxyURL string) error {
-	if err := jdb.Scraper.SetProxy(proxyURL); err != nil {
+	if jdb.browserTransport != nil {
+		if err := jdb.browserTransport.SetProxy(proxyURL); err != nil {
+			return err
+		}
+	} else if err := jdb.Scraper.SetProxy(proxyURL); err != nil {
 		return err
 	}
 	jdb.cookieCloudMu.Lock()
@@ -87,9 +108,12 @@ func (jdb *JavDBActor) SetProxy(proxyURL string) error {
 	return nil
 }
 
-// SetRequestTimeout sets timeout for scraper and CookieCloud.
+// SetRequestTimeout sets timeout for scraper, Chrome TLS client, and CookieCloud.
 func (jdb *JavDBActor) SetRequestTimeout(timeout time.Duration) {
 	jdb.Scraper.SetRequestTimeout(timeout)
+	if jdb.browserTransport != nil {
+		_ = jdb.browserTransport.SetTimeout(timeout)
+	}
 	jdb.cookieCloudMu.Lock()
 	jdb.cookieCloudTimeout = timeout
 	jdb.cookieCloudHTTPClient = nil
@@ -111,7 +135,7 @@ func (jdb *JavDBActor) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_UUID
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_PASSWORD
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_REFRESH_INTERVAL (optional)
-//	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_USER_AGENT (optional)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_USER_AGENT (optional; TLS fingerprint stays Chrome 150)
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__BASE_URL (optional, defaults to https://javdb.com/)
 func (jdb *JavDBActor) SetConfig(config provider.Config) error {
 	if config == nil {
@@ -124,7 +148,10 @@ func (jdb *JavDBActor) SetConfig(config provider.Config) error {
 		}
 		jdb.pageEndpoint = base + "actors/%s"
 		jdb.searchEndpoint = base + "search?f=actor&q=%s"
+		jdb.Scraper.SetHeaders(javDBDocumentHeaders(base))
 		jdb.Scraper.SetReferer(base)
+		jdb.Fetcher.SetHeaders(javDBImageHeaders(base))
+		jdb.Fetcher.SetReferer(base)
 	}
 	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
 	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")
@@ -149,6 +176,7 @@ func (jdb *JavDBActor) SetConfig(config provider.Config) error {
 	}
 	if value, ok := configValue(config, "cookiecloud_user_agent", "cookie_cloud_user_agent"); ok && value != "" {
 		jdb.Scraper.SetUserAgent(value)
+		jdb.Fetcher.SetUserAgent(value)
 	}
 
 	jdb.cookieCloudMu.Lock()

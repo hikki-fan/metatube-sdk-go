@@ -17,6 +17,7 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/text/language"
 
+	"github.com/metatube-community/metatube-sdk-go/common/chrometransport"
 	"github.com/metatube-community/metatube-sdk-go/common/fetch"
 	"github.com/metatube-community/metatube-sdk-go/common/number"
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
@@ -26,9 +27,11 @@ import (
 )
 
 var (
-	_ provider.MovieProvider = (*JavDB)(nil)
-	_ provider.MovieSearcher = (*JavDB)(nil)
-	_ provider.Fetcher       = (*JavDB)(nil)
+	_ provider.MovieProvider        = (*JavDB)(nil)
+	_ provider.MovieSearcher        = (*JavDB)(nil)
+	_ provider.Fetcher              = (*JavDB)(nil)
+	_ provider.ProxySetter          = (*JavDB)(nil)
+	_ provider.RequestTimeoutSetter = (*JavDB)(nil)
 )
 
 const (
@@ -129,27 +132,41 @@ type JavDB struct {
 	cookieCloudLastSuccess time.Time
 	cookieCloudLoaded      bool
 	cookieCloudLastError   error
+
+	browserTransport *chrometransport.Transport
 }
 
 func New() *JavDB {
+	fetchCfg := &fetch.Config{
+		UserAgent: defaultJavDBUserAgent,
+		Referer:   baseURL,
+		Headers:   javDBImageHeaders(baseURL),
+	}
+	scraperOpts := []scraper.Option{
+		scraper.WithUserAgent(defaultJavDBUserAgent),
+		scraper.WithHeaders(javDBDocumentHeaders(baseURL)),
+		scraper.WithCookies(baseURL, []*http.Cookie{
+			{Name: "locale", Value: "zh-CN"},
+		}),
+	}
+	browserTransport, _ := chrometransport.New()
+	if browserTransport != nil {
+		fetchCfg.Transport = browserTransport
+		scraperOpts = append(scraperOpts, scraper.WithTransport(browserTransport))
+	}
 	return &JavDB{
-		Fetcher: fetch.Default(&fetch.Config{Referer: baseURL}),
+		Fetcher: fetch.Default(fetchCfg),
 		Scraper: scraper.NewDefaultScraper(
 			Name, baseURL, Priority,
 			language.Japanese,
-			scraper.WithHeaders(map[string]string{
-				"Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
-				"Referer":         baseURL,
-			}),
-			scraper.WithCookies(baseURL, []*http.Cookie{
-				{Name: "locale", Value: "zh-CN"},
-			})),
+			scraperOpts...),
 		westernSearchLimiter: NewRandomWesternSearchLimiter(
 			DefaultWesternSearchMinInterval,
 			DefaultWesternSearchMaxInterval,
 		),
-		movieURL:  movieURL,
-		searchURL: searchURL,
+		movieURL:         movieURL,
+		searchURL:        searchURL,
+		browserTransport: browserTransport,
 	}
 }
 
@@ -177,11 +194,17 @@ func (jdb *JavDB) SetWesternSearchInterval(interval time.Duration) {
 	jdb.getWesternLimiter().SetInterval(interval)
 }
 
-// SetProxy applies the provider proxy to the JavDB scraper and remembers it
-// for the CookieCloud client. CookieCloud must use the same egress as JavDB so
-// browser session cookies (including anti-bot cookies) remain valid.
+// SetProxy applies the provider proxy to JavDB page/image requests and
+// remembers it for the CookieCloud client. CookieCloud must use the same
+// egress as JavDB so browser session cookies remain valid. When the Chrome
+// TLS transport is installed, proxy updates go there instead of colly.SetProxy,
+// which would replace the impersonating RoundTripper.
 func (jdb *JavDB) SetProxy(proxyURL string) error {
-	if err := jdb.Scraper.SetProxy(proxyURL); err != nil {
+	if jdb.browserTransport != nil {
+		if err := jdb.browserTransport.SetProxy(proxyURL); err != nil {
+			return err
+		}
+	} else if err := jdb.Scraper.SetProxy(proxyURL); err != nil {
 		return err
 	}
 	jdb.cookieCloudMu.Lock()
@@ -195,6 +218,9 @@ func (jdb *JavDB) SetProxy(proxyURL string) error {
 // request timeout.
 func (jdb *JavDB) SetRequestTimeout(timeout time.Duration) {
 	jdb.Scraper.SetRequestTimeout(timeout)
+	if jdb.browserTransport != nil {
+		_ = jdb.browserTransport.SetTimeout(timeout)
+	}
 	jdb.cookieCloudMu.Lock()
 	jdb.cookieCloudTimeout = timeout
 	jdb.cookieCloudHTTPClient = nil
@@ -218,10 +244,10 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_UUID
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL (optional)
-//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional)
+//	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional; TLS fingerprint stays Chrome 150)
 //	MT_MOVIE_PROVIDER_JAVDB__BASE_URL (optional, defaults to https://javdb.com/)
 //	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, a duration or
-//		a range such as 10s-25s; default 10s-25s)
+//		a range such as 10s-20s; default 10s-20s)
 //
 // The cookie refresh is lazy and cached for ten minutes by default, so service
 // startup does not depend on CookieCloud availability.
@@ -243,7 +269,10 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 		}
 		jdb.movieURL = base + "v/%s"
 		jdb.searchURL = base + "search?f=all&q=%s"
+		jdb.Scraper.SetHeaders(javDBDocumentHeaders(base))
 		jdb.Scraper.SetReferer(base)
+		jdb.Fetcher.SetHeaders(javDBImageHeaders(base))
+		jdb.Fetcher.SetReferer(base)
 	}
 	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
 	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")
@@ -268,6 +297,7 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 	}
 	if value, ok := configValue(config, "cookiecloud_user_agent", "cookie_cloud_user_agent"); ok && value != "" {
 		jdb.Scraper.SetUserAgent(value)
+		jdb.Fetcher.SetUserAgent(value)
 	}
 
 	jdb.cookieCloudMu.Lock()

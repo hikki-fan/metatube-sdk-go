@@ -7,6 +7,8 @@ require (
 	github.com/adrg/strutil v0.3.1
 	github.com/antchfx/htmlquery v1.3.6
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
+	github.com/bogdanfinn/fhttp v0.6.9
+	github.com/bogdanfinn/tls-client v1.16.0
 	github.com/corona10/goimagehash v1.1.0
 	github.com/disintegration/imaging v1.6.3-0.20201218193011-d40f48ce0f09
 	github.com/docker/go-units v0.5.0
@@ -54,15 +56,22 @@ require (
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 // indirect
+	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/andybalholm/cascadia v1.3.4 // indirect
 	github.com/antchfx/xmlquery v1.5.1 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
+	github.com/bdandy/go-errors v1.2.2 // indirect
+	github.com/bdandy/go-socks4 v1.2.3 // indirect
 	github.com/bits-and-blooms/bitset v1.24.6 // indirect
+	github.com/bogdanfinn/quic-go-utls v1.0.10-utls // indirect
+	github.com/bogdanfinn/utls v1.7.8-barnius // indirect
+	github.com/bogdanfinn/websocket v1.5.6-barnius // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic v1.15.2 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
+	github.com/cloudflare/circl v1.6.2 // indirect
 	github.com/cloudwego/base64x v0.1.7 // indirect
 	github.com/containerd/continuity v0.4.5 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -90,6 +99,7 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/kennygrant/sanitize v1.2.4 // indirect
+	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/liuzl/cedar-go v0.0.0-20170805034717-80a9c64b256d // indirect
@@ -115,6 +125,7 @@ require (
 	github.com/rogpeppe/go-internal v1.11.0 // indirect
 	github.com/saintfish/chardet v0.0.0-20230101081208-5e3ef4b5456d // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect
 	github.com/temoto/robotstxt v1.1.2 // indirect
 	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect

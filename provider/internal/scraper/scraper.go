@@ -82,6 +82,16 @@ func (s *Scraper) ClonedCollector() *colly.Collector { return s.c.Clone() }
 // SetProxy sets http or socks5 proxy for HTTP requests.
 func (s *Scraper) SetProxy(proxyURL string) error { return s.c.SetProxy(proxyURL) }
 
+// SetTransport replaces the collector RoundTripper. Callers that install a
+// custom transport must not later call SetProxy, because colly replaces a
+// non-*http.Transport with a plain proxy transport.
+func (s *Scraper) SetTransport(rt http.RoundTripper) {
+	if s == nil || s.c == nil || rt == nil {
+		return
+	}
+	s.c.WithTransport(rt)
+}
+
 // SetCookies adds cookies to the collector's cookie jar. Providers that
 // refresh browser sessions at runtime can use this method before cloning a
 // collector for a request.
@@ -92,6 +102,15 @@ func (s *Scraper) SetCookies(rawURL string, cookies []*http.Cookie) error {
 // SetUserAgent overrides the collector's User-Agent header.
 func (s *Scraper) SetUserAgent(userAgent string) {
 	s.c.UserAgent = userAgent
+}
+
+// SetHeaders overrides default headers for future scraper requests.
+func (s *Scraper) SetHeaders(headers map[string]string) {
+	s.c.OnRequest(func(r *colly.Request) {
+		for key, value := range headers {
+			r.Headers.Set(key, value)
+		}
+	})
 }
 
 // SetReferer overrides the Referer header for future scraper requests.
