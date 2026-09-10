@@ -94,5 +94,12 @@ func (s *Scraper) SetUserAgent(userAgent string) {
 	s.c.UserAgent = userAgent
 }
 
+// SetReferer overrides the Referer header for future scraper requests.
+func (s *Scraper) SetReferer(referer string) {
+	s.c.OnRequest(func(r *colly.Request) {
+		r.Headers.Set("Referer", referer)
+	})
+}
+
 // SetRequestTimeout sets timeout for HTTP requests.
 func (s *Scraper) SetRequestTimeout(timeout time.Duration) { s.c.SetRequestTimeout(timeout) }

@@ -38,6 +38,22 @@ const (
 	Priority = 1010
 )
 
+var javDBMirrorHostPattern = regexp.MustCompile(`^javdb(?:\d+)?\.com$`)
+
+func normalizeJavDBBaseURL(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Path != "" && parsed.Path != "/") {
+		return "", fmt.Errorf("invalid JavDB base URL")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if !javDBMirrorHostPattern.MatchString(host) || parsed.Port() != "" {
+		return "", fmt.Errorf("invalid JavDB base URL")
+	}
+	return "https://" + host + "/", nil
+}
+
 const (
 	baseURL   = "https://javdb.com/"
 	movieURL  = "https://javdb.com/v/%s"
@@ -203,6 +219,7 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL (optional)
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional)
+//	MT_MOVIE_PROVIDER_JAVDB__BASE_URL (optional, defaults to https://javdb.com/)
 //	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, a duration or
 //		a range such as 10s-25s; default 10s-25s)
 //
@@ -218,6 +235,15 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 			return fmt.Errorf("invalid JavDB Western search interval")
 		}
 		jdb.getWesternLimiter().SetIntervalRange(minInterval, maxInterval)
+	}
+	if value, ok := configValue(config, "base_url", "javdb_base_url"); ok && value != "" {
+		base, err := normalizeJavDBBaseURL(value)
+		if err != nil {
+			return err
+		}
+		jdb.movieURL = base + "v/%s"
+		jdb.searchURL = base + "search?f=all&q=%s"
+		jdb.Scraper.SetReferer(base)
 	}
 	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
 	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")

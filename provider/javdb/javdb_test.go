@@ -32,6 +32,28 @@ func TestJavDB_SearchMovieExactNumber(t *testing.T) {
 	assert.NotEmpty(t, results[0].CoverURL)
 }
 
+func TestJavDB_SetConfigBaseURL(t *testing.T) {
+	config := envconfig.NewConfig()
+	config.Set("base_url", "https://javdb580.com/")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	assert.Equal(t, "https://javdb580.com/v/%s", jdb.movieURL)
+	assert.Equal(t, "https://javdb580.com/search?f=all&q=%s", jdb.searchURL)
+	assert.True(t, cookieCloudDomainAllowed(".javdb580.com"))
+
+	for _, value := range []string{
+		"http://javdb580.com/",
+		"https://javdb580.com.evil/",
+		"https://example.com/",
+		"https://javdb580.com/other",
+	} {
+		config := envconfig.NewConfig()
+		config.Set("base_url", value)
+		assert.Error(t, New().SetConfig(config), value)
+	}
+}
+
 func TestJavDB_GetMovieInfoByID(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live network test in short mode")

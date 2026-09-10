@@ -58,11 +58,13 @@ MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_PASSWORD=<cookiecloud-end-to-end-password>
 # Optional:
 MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL=10m
 MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT=<browser-user-agent>
+# Optional rotating JavDB domain. The CookieCloud browser session must include this domain.
+MT_MOVIE_PROVIDER_JAVDB__BASE_URL=https://javdb580.com/
 ```
 
-Only cookies whose domains are `javdb.com` (or its subdomains) and
-`jdbstatic.com` (or its subdomains) are imported. Credentials stay in memory
-and are never logged or persisted by the SDK.
+Only cookies for `javdb.com`, an approved `javdb<digits>.com` mirror (and
+their subdomains), or `jdbstatic.com` (and its subdomains) are imported.
+Credentials stay in memory and are never logged or persisted by the SDK.
 
 ### AV-LEAGUE actor enrichment
 
@@ -83,6 +85,7 @@ MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_PASSWORD=<cookiecloud-end-to-end-passw
 # Optional:
 MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_REFRESH_INTERVAL=10m
 MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_USER_AGENT=<browser-user-agent>
+MT_ACTOR_PROVIDER_JAVDBACTOR__BASE_URL=https://javdb580.com/
 ```
 
 Cached actor records are enriched once per process within the retry window;

@@ -44,6 +44,7 @@ type JavDBActor struct {
 	// searchEndpoint is kept overridable for fixture tests. Production uses
 	// actorSearchURL and still builds the keyword through QueryEscape.
 	searchEndpoint string
+	pageEndpoint   string
 
 	cookieCloudMu          sync.Mutex
 	cookieCloud            *cookieCloudClient
@@ -70,6 +71,7 @@ func NewActor() *JavDBActor {
 				{Name: "locale", Value: "zh-CN"},
 			})),
 		searchEndpoint: actorSearchURL,
+		pageEndpoint:   actorPageURL,
 	}
 }
 
@@ -110,9 +112,19 @@ func (jdb *JavDBActor) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_PASSWORD
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_REFRESH_INTERVAL (optional)
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_USER_AGENT (optional)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__BASE_URL (optional, defaults to https://javdb.com/)
 func (jdb *JavDBActor) SetConfig(config provider.Config) error {
 	if config == nil {
 		return nil
+	}
+	if value, ok := configValue(config, "base_url", "javdb_base_url"); ok && value != "" {
+		base, err := normalizeJavDBBaseURL(value)
+		if err != nil {
+			return err
+		}
+		jdb.pageEndpoint = base + "actors/%s"
+		jdb.searchEndpoint = base + "search?f=actor&q=%s"
+		jdb.Scraper.SetReferer(base)
 	}
 	host, hostSet := configValue(config, "cookiecloud_host", "cookie_cloud_host")
 	uuid, uuidSet := configValue(config, "cookiecloud_uuid", "cookie_cloud_uuid")
@@ -252,7 +264,11 @@ func (jdb *JavDBActor) ParseActorIDFromURL(rawURL string) (string, error) {
 }
 
 func (jdb *JavDBActor) GetActorInfoByID(id string) (*model.ActorInfo, error) {
-	return jdb.GetActorInfoByURL(fmt.Sprintf(actorPageURL, id))
+	endpoint := jdb.pageEndpoint
+	if endpoint == "" {
+		endpoint = actorPageURL
+	}
+	return jdb.GetActorInfoByURL(fmt.Sprintf(endpoint, id))
 }
 
 func (jdb *JavDBActor) GetActorInfoByURL(rawURL string) (info *model.ActorInfo, err error) {

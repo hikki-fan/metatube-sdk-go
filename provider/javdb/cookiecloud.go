@@ -170,7 +170,7 @@ func cookieCloudCookies(byDomain map[string][]cookieCloudCookie) []*http.Cookie 
 
 func cookieCloudDomainAllowed(domain string) bool {
 	domain = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(domain)), ".")
-	return domain == "javdb.com" || strings.HasSuffix(domain, ".javdb.com") ||
+	return javDBMirrorHostPattern.MatchString(domain) || strings.HasSuffix(domain, ".javdb.com") ||
 		domain == "jdbstatic.com" || strings.HasSuffix(domain, ".jdbstatic.com")
 }
 
