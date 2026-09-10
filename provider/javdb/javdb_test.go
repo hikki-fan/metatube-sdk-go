@@ -1,14 +1,20 @@
 package javdb
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/metatube-community/metatube-sdk-go/internal/envconfig"
+	"github.com/metatube-community/metatube-sdk-go/model"
 )
 
 func TestJavDB_SearchMovieExactNumber(t *testing.T) {
@@ -560,4 +566,352 @@ func TestJavDB_GetMovieInfoByURL_PreservesMetadataAndFiltersActors(t *testing.T)
 
 	// Verify actor gender filtering (only female kept)
 	assert.Equal(t, []string{"三上悠亜"}, []string(info.Actors))
+}
+
+func TestJavDB_GetMovieInfoByURL_403RecoverySuccess(t *testing.T) {
+	var cookieCloudCalls atomic.Int32
+	cookieCloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieCloudCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cookieCloudResponse{Encrypted: cookieCloudLegacyFixture})
+	}))
+	defer cookieCloudServer.Close()
+
+	const movieHTML = `
+<!DOCTYPE html>
+<html>
+<head><title>BYD-115 - JavDB</title></head>
+<body>
+  <div class="video-detail">
+    <h2 class="title">
+      <strong>BYD-115</strong>
+      <strong class="current-title">Recovered Title</strong>
+    </h2>
+  </div>
+  <div class="column-video-cover">
+    <img class="video-cover" src="https://c0.jdbstatic.com/covers/gn/GnyQ.jpg">
+  </div>
+  <nav class="movie-panel-info">
+    <div class="panel-block">
+      <strong>番號:</strong>
+      <span class="value">BYD-115</span>
+    </div>
+  </nav>
+</body>
+</html>`
+
+	var javdbCalls atomic.Int32
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := javdbCalls.Add(1)
+		if count == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("Forbidden"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(movieHTML))
+	}))
+	defer javdbServer.Close()
+
+	config := envconfig.NewConfig()
+	config.Set("cookiecloud_host", cookieCloudServer.URL)
+	config.Set("cookiecloud_uuid", "test-uuid")
+	config.Set("cookiecloud_password", "test-password")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.cookieCloudHTTPClient = cookieCloudServer.Client()
+	require.NoError(t, jdb.ensureCookieCloudCookies())
+	cookieCloudCalls.Store(0)
+
+	info, err := jdb.GetMovieInfoByURL(fmt.Sprintf("%s/v/GnyQ", javdbServer.URL))
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, "BYD-115", info.Number)
+	assert.Equal(t, "Recovered Title", info.Title)
+
+	assert.Equal(t, int32(2), javdbCalls.Load(), "expected initial 403 request + 1 retry")
+	assert.Equal(t, int32(1), cookieCloudCalls.Load(), "expected 1 CookieCloud refresh")
+}
+
+func TestJavDB_GetMovieInfoByURL_403Persistent(t *testing.T) {
+	var cookieCloudCalls atomic.Int32
+	cookieCloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieCloudCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cookieCloudResponse{Encrypted: cookieCloudLegacyFixture})
+	}))
+	defer cookieCloudServer.Close()
+
+	var javdbCalls atomic.Int32
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		javdbCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("Forbidden"))
+	}))
+	defer javdbServer.Close()
+
+	config := envconfig.NewConfig()
+	config.Set("cookiecloud_host", cookieCloudServer.URL)
+	config.Set("cookiecloud_uuid", "test-uuid")
+	config.Set("cookiecloud_password", "test-password")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.cookieCloudHTTPClient = cookieCloudServer.Client()
+	require.NoError(t, jdb.ensureCookieCloudCookies())
+	cookieCloudCalls.Store(0)
+
+	info, err := jdb.GetMovieInfoByURL(fmt.Sprintf("%s/v/GnyQ", javdbServer.URL))
+	require.Error(t, err)
+	assert.Nil(t, info)
+	assert.Contains(t, err.Error(), "Forbidden")
+
+	assert.Equal(t, int32(2), javdbCalls.Load(), "expected exactly 1 retry (2 total requests, no loop)")
+	assert.Equal(t, int32(1), cookieCloudCalls.Load(), "expected 1 CookieCloud refresh")
+}
+
+func TestJavDB_SearchMovie_403RecoverySuccess(t *testing.T) {
+	var cookieCloudCalls atomic.Int32
+	cookieCloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieCloudCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cookieCloudResponse{Encrypted: cookieCloudLegacyFixture})
+	}))
+	defer cookieCloudServer.Close()
+
+	const searchHTML = `
+<!DOCTYPE html>
+<html>
+<body>
+  <div class="movie-list">
+    <div class="item">
+      <a class="box" href="/v/TEST123" title="Test Search Recovered">
+        <div class="cover">
+          <img src="https://c0.jdbstatic.com/covers/te/TEST123.jpg">
+        </div>
+        <div class="video-title">
+          <strong>TEST-123</strong>
+        </div>
+        <div class="meta">2023-08-01</div>
+      </a>
+    </div>
+  </div>
+</body>
+</html>`
+
+	var javdbCalls atomic.Int32
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := javdbCalls.Add(1)
+		if count == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("Forbidden"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(searchHTML))
+	}))
+	defer javdbServer.Close()
+
+	config := envconfig.NewConfig()
+	config.Set("cookiecloud_host", cookieCloudServer.URL)
+	config.Set("cookiecloud_uuid", "test-uuid")
+	config.Set("cookiecloud_password", "test-password")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.cookieCloudHTTPClient = cookieCloudServer.Client()
+	jdb.searchURL = javdbServer.URL + "/search?f=all&q=%s"
+	require.NoError(t, jdb.ensureCookieCloudCookies())
+	cookieCloudCalls.Store(0)
+
+	results, err := jdb.SearchMovie("TEST-123")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "TEST-123", results[0].Number)
+	assert.Equal(t, "TEST123", results[0].ID)
+	assert.Equal(t, "Test Search Recovered", results[0].Title)
+
+	assert.Equal(t, int32(2), javdbCalls.Load(), "expected 1 initial 403 + 1 retry")
+	assert.Equal(t, int32(1), cookieCloudCalls.Load(), "expected 1 CookieCloud refresh")
+}
+
+func TestJavDB_SearchMovie_403Persistent(t *testing.T) {
+	var cookieCloudCalls atomic.Int32
+	cookieCloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieCloudCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cookieCloudResponse{Encrypted: cookieCloudLegacyFixture})
+	}))
+	defer cookieCloudServer.Close()
+
+	var javdbCalls atomic.Int32
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		javdbCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("Forbidden"))
+	}))
+	defer javdbServer.Close()
+
+	config := envconfig.NewConfig()
+	config.Set("cookiecloud_host", cookieCloudServer.URL)
+	config.Set("cookiecloud_uuid", "test-uuid")
+	config.Set("cookiecloud_password", "test-password")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.cookieCloudHTTPClient = cookieCloudServer.Client()
+	jdb.searchURL = javdbServer.URL + "/search?f=all&q=%s"
+	require.NoError(t, jdb.ensureCookieCloudCookies())
+	cookieCloudCalls.Store(0)
+
+	results, err := jdb.SearchMovie("TEST-123")
+	require.Error(t, err)
+	assert.Empty(t, results)
+	assert.Contains(t, err.Error(), "Forbidden")
+
+	assert.Equal(t, int32(2), javdbCalls.Load(), "expected exactly 1 retry (2 total requests, no loop)")
+	assert.Equal(t, int32(1), cookieCloudCalls.Load(), "expected 1 CookieCloud refresh")
+}
+
+func TestJavDB_403_CookieCloudUnconfigured(t *testing.T) {
+	var javdbCalls atomic.Int32
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		javdbCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("Forbidden"))
+	}))
+	defer javdbServer.Close()
+
+	jdb := New()
+	info, err := jdb.GetMovieInfoByURL(fmt.Sprintf("%s/v/GnyQ", javdbServer.URL))
+	require.Error(t, err)
+	assert.Nil(t, info)
+	assert.Contains(t, err.Error(), "Forbidden")
+
+	assert.Equal(t, int32(1), javdbCalls.Load(), "expected no retry when CookieCloud is unconfigured")
+}
+
+func TestJavDB_403_CookieCloudRefreshFails(t *testing.T) {
+	var cookieCloudCalls atomic.Int32
+	var cookieCloudFails atomic.Bool
+	cookieCloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieCloudCalls.Add(1)
+		if cookieCloudFails.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cookieCloudResponse{Encrypted: cookieCloudLegacyFixture})
+	}))
+	defer cookieCloudServer.Close()
+
+	var javdbCalls atomic.Int32
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		javdbCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("Forbidden"))
+	}))
+	defer javdbServer.Close()
+
+	config := envconfig.NewConfig()
+	config.Set("cookiecloud_host", cookieCloudServer.URL)
+	config.Set("cookiecloud_uuid", "test-uuid")
+	config.Set("cookiecloud_password", "test-password")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.cookieCloudHTTPClient = cookieCloudServer.Client()
+	require.NoError(t, jdb.ensureCookieCloudCookies())
+	cookieCloudCalls.Store(0)
+	cookieCloudFails.Store(true)
+
+	info, err := jdb.GetMovieInfoByURL(fmt.Sprintf("%s/v/GnyQ", javdbServer.URL))
+	require.Error(t, err)
+	assert.Nil(t, info)
+	assert.Contains(t, err.Error(), "Forbidden", "preserves original 403 error semantics")
+
+	assert.Equal(t, int32(1), javdbCalls.Load(), "expected no retry when CookieCloud refresh fails")
+	assert.Equal(t, int32(1), cookieCloudCalls.Load(), "expected 1 CookieCloud refresh attempt")
+}
+
+func TestJavDB_CookieCacheSynchronization_ConcurrencySafe(t *testing.T) {
+	var cookieCloudCalls atomic.Int32
+	cookieCloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieCloudCalls.Add(1)
+		time.Sleep(10 * time.Millisecond) // simulate slight latency
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cookieCloudResponse{Encrypted: cookieCloudLegacyFixture})
+	}))
+	defer cookieCloudServer.Close()
+
+	const movieHTML = `
+<!DOCTYPE html>
+<html>
+<head><title>BYD-115 - JavDB</title></head>
+<body>
+  <div class="video-detail">
+    <h2 class="title">
+      <strong>BYD-115</strong>
+      <strong class="current-title">Concurrent Title</strong>
+    </h2>
+  </div>
+  <div class="column-video-cover">
+    <img class="video-cover" src="https://c0.jdbstatic.com/covers/gn/GnyQ.jpg">
+  </div>
+  <nav class="movie-panel-info">
+    <div class="panel-block">
+      <strong>番號:</strong>
+      <span class="value">BYD-115</span>
+    </div>
+  </nav>
+</body>
+</html>`
+
+	var pathCounts sync.Map
+	javdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		val, _ := pathCounts.LoadOrStore(r.URL.Path, new(atomic.Int32))
+		counter := val.(*atomic.Int32)
+		if counter.Add(1) == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("Forbidden"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(movieHTML))
+	}))
+	defer javdbServer.Close()
+
+	config := envconfig.NewConfig()
+	config.Set("cookiecloud_host", cookieCloudServer.URL)
+	config.Set("cookiecloud_uuid", "test-uuid")
+	config.Set("cookiecloud_password", "test-password")
+
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.cookieCloudHTTPClient = cookieCloudServer.Client()
+
+	const concurrency = 5
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+	infos := make([]*model.MovieInfo, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			infos[idx], errs[idx] = jdb.GetMovieInfoByURL(fmt.Sprintf("%s/v/GnyQ%d", javdbServer.URL, idx))
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i := 0; i < concurrency; i++ {
+		require.NoError(t, errs[i], "concurrent request %d failed", i)
+		require.NotNil(t, infos[i], "concurrent request %d returned nil info", i)
+		assert.Equal(t, "BYD-115", infos[i].Number)
+	}
 }

@@ -1,6 +1,7 @@
 package javdb
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -97,6 +98,9 @@ type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
 
+	movieURL  string
+	searchURL string
+
 	westernLimiterMu     sync.Mutex
 	westernSearchLimiter *WesternSearchLimiter
 
@@ -128,6 +132,8 @@ func New() *JavDB {
 			DefaultWesternSearchMinInterval,
 			DefaultWesternSearchMaxInterval,
 		),
+		movieURL:  movieURL,
+		searchURL: searchURL,
 	}
 }
 
@@ -293,6 +299,45 @@ func (jdb *JavDB) cookieCloudHTTPClientLocked() *http.Client {
 	return jdb.cookieCloudHTTPClient
 }
 
+func (jdb *JavDB) refreshCookieCloudLocked(now time.Time, force bool) error {
+	jdb.cookieCloudLastAttempt = now
+	jdb.cookieCloud.httpClient = jdb.cookieCloudHTTPClientLocked()
+	cookies, err := jdb.cookieCloud.fetchCookies()
+	if err != nil {
+		jdb.cookieCloudLastError = err
+		if !force && jdb.cookieCloudLoaded {
+			return nil
+		}
+		return err
+	}
+	if len(cookies) == 0 {
+		err = fmt.Errorf("CookieCloud contains no JavDB cookies")
+		jdb.cookieCloudLastError = err
+		if !force && jdb.cookieCloudLoaded {
+			return nil
+		}
+		return err
+	}
+	for _, cookie := range cookies {
+		domain := strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
+		if domain == "" {
+			domain = "javdb.com"
+		}
+		cookieURL := "https://" + domain + "/"
+		if err = jdb.SetCookies(cookieURL, []*http.Cookie{cookie}); err != nil {
+			jdb.cookieCloudLastError = fmt.Errorf("apply CookieCloud cookies: %w", err)
+			if !force && jdb.cookieCloudLoaded {
+				return nil
+			}
+			return jdb.cookieCloudLastError
+		}
+	}
+	jdb.cookieCloudLoaded = true
+	jdb.cookieCloudLastSuccess = now
+	jdb.cookieCloudLastError = nil
+	return nil
+}
+
 // ensureCookieCloudCookies refreshes the CookieCloud session lazily. A
 // previously loaded session is retained when a later refresh temporarily
 // fails, avoiding an unnecessary fallback to anonymous JavDB requests.
@@ -312,39 +357,38 @@ func (jdb *JavDB) ensureCookieCloudCookies() error {
 		}
 		return jdb.cookieCloudLastError
 	}
-	jdb.cookieCloudLastAttempt = now
-	jdb.cookieCloud.httpClient = jdb.cookieCloudHTTPClientLocked()
-	cookies, err := jdb.cookieCloud.fetchCookies()
+	return jdb.refreshCookieCloudLocked(now, false)
+}
+
+func (jdb *JavDB) isCookieCloudConfigured() bool {
+	jdb.cookieCloudMu.Lock()
+	defer jdb.cookieCloudMu.Unlock()
+	return jdb.cookieCloud != nil
+}
+
+func (jdb *JavDB) forceCookieCloudRefresh(attemptStart time.Time) error {
+	jdb.cookieCloudMu.Lock()
+	defer jdb.cookieCloudMu.Unlock()
+	if jdb.cookieCloud == nil {
+		return errors.New("CookieCloud is not configured")
+	}
+	if !attemptStart.IsZero() && jdb.cookieCloudLastSuccess.After(attemptStart) {
+		return nil
+	}
+	return jdb.refreshCookieCloudLocked(time.Now(), true)
+}
+
+func isForbidden(statusCode int, err error) bool {
+	if statusCode == http.StatusForbidden {
+		return true
+	}
 	if err != nil {
-		jdb.cookieCloudLastError = err
-		if jdb.cookieCloudLoaded {
-			return nil
-		}
-		return err
-	}
-	if len(cookies) == 0 {
-		err = fmt.Errorf("CookieCloud contains no JavDB cookies")
-		jdb.cookieCloudLastError = err
-		return err
-	}
-	for _, cookie := range cookies {
-		domain := strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
-		if domain == "" {
-			domain = "javdb.com"
-		}
-		cookieURL := "https://" + domain + "/"
-		if err = jdb.SetCookies(cookieURL, []*http.Cookie{cookie}); err != nil {
-			jdb.cookieCloudLastError = fmt.Errorf("apply CookieCloud cookies: %w", err)
-			if jdb.cookieCloudLoaded {
-				return nil
-			}
-			return jdb.cookieCloudLastError
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "403") || strings.Contains(msg, "forbidden") {
+			return true
 		}
 	}
-	jdb.cookieCloudLoaded = true
-	jdb.cookieCloudLastSuccess = now
-	jdb.cookieCloudLastError = nil
-	return nil
+	return false
 }
 
 // JavDB uses a case-sensitive opaque ID in /v/<id> URLs.
@@ -364,19 +408,20 @@ func (jdb *JavDB) ParseMovieIDFromURL(rawURL string) (string, error) {
 }
 
 func (jdb *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
-	return jdb.GetMovieInfoByURL(fmt.Sprintf(movieURL, id))
+	endpoint := jdb.movieURL
+	if endpoint == "" {
+		endpoint = movieURL
+	}
+	return jdb.GetMovieInfoByURL(fmt.Sprintf(endpoint, id))
 }
 
-func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err error) {
-	if err = jdb.ensureCookieCloudCookies(); err != nil {
-		return nil, err
-	}
+func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error) {
 	id, err := jdb.ParseMovieIDFromURL(rawURL)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	info = &model.MovieInfo{
+	info := &model.MovieInfo{
 		ID:            id,
 		Provider:      jdb.Name(),
 		Homepage:      rawURL,
@@ -386,6 +431,13 @@ func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err e
 	}
 
 	c := jdb.ClonedCollector()
+
+	var statusCode int
+	c.OnError(func(r *colly.Response, err error) {
+		if r != nil {
+			statusCode = r.StatusCode
+		}
+	})
 
 	c.OnXML(`//div[contains(@class,"video-detail")]//h2[contains(@class,"title")]`, func(e *colly.XMLElement) {
 		info.Number = strings.TrimSpace(e.ChildText(`.//strong[1]`))
@@ -448,21 +500,56 @@ func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err e
 	})
 
 	err = c.Visit(info.Homepage)
-	return
+	if err != nil {
+		return nil, statusCode, err
+	}
+	return info, statusCode, nil
+}
+
+func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
+	if err := jdb.ensureCookieCloudCookies(); err != nil {
+		return nil, err
+	}
+	attemptStart := time.Now()
+	info, statusCode, err := jdb.getMovieInfoByURL(rawURL)
+	if isForbidden(statusCode, err) {
+		if err == nil {
+			err = errors.New(http.StatusText(http.StatusForbidden))
+		}
+		if jdb.isCookieCloudConfigured() {
+			if refreshErr := jdb.forceCookieCloudRefresh(attemptStart); refreshErr == nil {
+				infoRetry, statusCodeRetry, retryErr := jdb.getMovieInfoByURL(rawURL)
+				if isForbidden(statusCodeRetry, retryErr) && retryErr == nil {
+					retryErr = errors.New(http.StatusText(http.StatusForbidden))
+				}
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				return infoRetry, nil
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
 }
 
 func (jdb *JavDB) NormalizeMovieKeyword(keyword string) string {
 	return strings.ToUpper(strings.TrimSpace(keyword))
 }
 
-func (jdb *JavDB) SearchMovie(keyword string) (results []*model.MovieSearchResult, err error) {
-	if number.IsWestern(keyword) {
-		jdb.getWesternLimiter().Wait()
-	}
-	if err = jdb.ensureCookieCloudCookies(); err != nil {
-		return nil, err
-	}
+func (jdb *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, int, error) {
+	var results []*model.MovieSearchResult
 	c := jdb.ClonedCollector()
+
+	var statusCode int
+	c.OnError(func(r *colly.Response, err error) {
+		if r != nil {
+			statusCode = r.StatusCode
+		}
+	})
+
 	c.OnXML(`//div[contains(@class,"movie-list")]//div[contains(@class,"item")]/a[contains(@class,"box")]`, func(e *colly.XMLElement) {
 		homepage := e.Request.AbsoluteURL(e.Attr("href"))
 		id, parseErr := jdb.ParseMovieIDFromURL(homepage)
@@ -482,8 +569,47 @@ func (jdb *JavDB) SearchMovie(keyword string) (results []*model.MovieSearchResul
 		})
 	})
 
-	err = c.Visit(fmt.Sprintf(searchURL, url.QueryEscape(keyword)))
-	return
+	endpoint := jdb.searchURL
+	if endpoint == "" {
+		endpoint = searchURL
+	}
+	err := c.Visit(fmt.Sprintf(endpoint, url.QueryEscape(keyword)))
+	if err != nil {
+		return nil, statusCode, err
+	}
+	return results, statusCode, nil
+}
+
+func (jdb *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error) {
+	if number.IsWestern(keyword) {
+		jdb.getWesternLimiter().Wait()
+	}
+	if err := jdb.ensureCookieCloudCookies(); err != nil {
+		return nil, err
+	}
+	attemptStart := time.Now()
+	results, statusCode, err := jdb.searchMovie(keyword)
+	if isForbidden(statusCode, err) {
+		if err == nil {
+			err = errors.New(http.StatusText(http.StatusForbidden))
+		}
+		if jdb.isCookieCloudConfigured() {
+			if refreshErr := jdb.forceCookieCloudRefresh(attemptStart); refreshErr == nil {
+				resultsRetry, statusCodeRetry, retryErr := jdb.searchMovie(keyword)
+				if isForbidden(statusCodeRetry, retryErr) && retryErr == nil {
+					retryErr = errors.New(http.StatusText(http.StatusForbidden))
+				}
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				return resultsRetry, nil
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func extractImageSrc(e *colly.XMLElement, xpath string) string {
