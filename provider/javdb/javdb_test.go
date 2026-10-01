@@ -65,7 +65,6 @@ func TestJavDB_GetMovieInfoByID(t *testing.T) {
 	assert.True(t, info.IsValid())
 	assert.Equal(t, "BYD-115", info.Number)
 	assert.Equal(t, 110, info.Runtime)
-	assert.NotEmpty(t, info.Actors)
 	assert.NotEmpty(t, info.Genres)
 }
 
@@ -345,6 +344,46 @@ func TestJavDB_GetMovieInfoByURL_ActorGender_FemaleRetained(t *testing.T) {
 	assert.Equal(t, []string{"三上悠亜"}, []string(info.Actors))
 }
 
+func TestJavDB_GetMovieInfoByURL_ActorGender_FemaleClassOnActorLink(t *testing.T) {
+	const html = `
+<!DOCTYPE html>
+<html>
+<body>
+  <div class="video-detail">
+    <h2 class="title">
+      <strong>TEST-105</strong>
+      <strong class="current-title">Female Class On Actor Link</strong>
+    </h2>
+  </div>
+  <div class="column-video-cover">
+    <img class="video-cover" src="https://c0.jdbstatic.com/covers/gn/TEST105.jpg">
+  </div>
+  <nav class="movie-panel-info">
+    <div class="panel-block">
+      <strong>演員:</strong>
+      <span class="value">
+        <a class="actor-female" href="/actors/v0w">与田りん</a>,
+        <a href="/actors/m01">吉野篤史</a>
+      </span>
+    </div>
+  </nav>
+</body>
+</html>`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(html))
+	}))
+	defer server.Close()
+
+	info, err := New().GetMovieInfoByURL(fmt.Sprintf("%s/v/TEST105", server.URL))
+	require.NoError(t, err)
+	require.NotNil(t, info)
+
+	assert.Equal(t, []string{"与田りん"}, []string(info.Actors))
+}
+
 func TestJavDB_GetMovieInfoByURL_ActorGender_MaleFiltered(t *testing.T) {
 	const html = `
 <!DOCTYPE html>
@@ -426,7 +465,7 @@ func TestJavDB_GetMovieInfoByURL_ActorGender_MixedPerformers(t *testing.T) {
 	assert.Equal(t, []string{"三上悠亜", "吉沢明歩"}, []string(info.Actors))
 }
 
-func TestJavDB_GetMovieInfoByURL_ActorGender_UnmarkedFallback(t *testing.T) {
+func TestJavDB_GetMovieInfoByURL_ActorGender_UnmarkedFiltered(t *testing.T) {
 	const html = `
 <!DOCTYPE html>
 <html>
@@ -464,7 +503,7 @@ func TestJavDB_GetMovieInfoByURL_ActorGender_UnmarkedFallback(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 
-	assert.Equal(t, []string{"河北彩花", "小宵こなん"}, []string(info.Actors))
+	assert.Empty(t, info.Actors)
 }
 
 func TestJavDB_GetMovieInfoByURL_PreservesMetadataAndFiltersActors(t *testing.T) {

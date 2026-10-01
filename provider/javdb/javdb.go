@@ -539,7 +539,9 @@ func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error
 			}
 		case "演員", "演员", "出演者", "Actors":
 			for _, aNode := range htmlquery.Find(e.DOM.(*html.Node), `.//span[contains(@class,"value")]//a`) {
-				if isMaleActorNode(aNode) {
+				// JavDB movie actor lists are female-only by policy. Do not
+				// guess from an unmarked name: keep only explicit female markers.
+				if !isFemaleActorNode(aNode) {
 					continue
 				}
 				if actor := extractActorName(aNode); actor != "" {
@@ -678,6 +680,9 @@ func extractImageSrc(e *colly.XMLElement, xpath string) string {
 }
 
 func isMaleActorNode(n *html.Node) bool {
+	if isMaleElement(n) {
+		return true
+	}
 	for sib := n.NextSibling; sib != nil; sib = sib.NextSibling {
 		if sib.Type == html.ElementNode {
 			if sib.Data == "a" {
@@ -693,6 +698,24 @@ func isMaleActorNode(n *html.Node) bool {
 		return true
 	}
 	return false
+}
+
+func isFemaleActorNode(n *html.Node) bool {
+	if isFemaleElement(n) {
+		return true
+	}
+	for sib := n.NextSibling; sib != nil; sib = sib.NextSibling {
+		if sib.Type == html.ElementNode {
+			if sib.Data == "a" {
+				break
+			}
+			if isFemaleElement(sib) {
+				return true
+			}
+			break
+		}
+	}
+	return containsFemaleElement(n)
 }
 
 func isMaleElement(n *html.Node) bool {
@@ -734,6 +757,17 @@ func containsMaleElement(n *html.Node) bool {
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
 		if c.Type == html.ElementNode {
 			if isMaleElement(c) || containsMaleElement(c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsFemaleElement(n *html.Node) bool {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode {
+			if isFemaleElement(c) || containsFemaleElement(c) {
 				return true
 			}
 		}
