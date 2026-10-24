@@ -3,10 +3,12 @@ package javdb
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,7 +63,51 @@ const (
 	baseURL   = "https://javdb.com/"
 	movieURL  = "https://javdb.com/v/%s"
 	searchURL = "https://javdb.com/search?f=all&q=%s"
+
+	defaultMirrorEnabled = true
+	defaultMirrorBaseURL = "https://jdforrepam.com/api"
+	defaultMirrorTimeout = 8 * time.Second
 )
+
+// ErrLoginRequired is returned when JavDB redirects a request to a login page
+// or responds with an explicit login form instead of movie/search content.
+var ErrLoginRequired = errors.New("javdb: login required")
+
+type javDBMirror interface {
+	SearchMovie(keyword string) ([]*model.MovieSearchResult, error)
+	GetMovieInfoByID(id string) (*model.MovieInfo, error)
+}
+
+func isJavDBOriginURL(raw string) bool {
+	parsed, err := url.Parse(strings.ReplaceAll(strings.TrimSpace(raw), "%s", "fixture"))
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return javDBMirrorHostPattern.MatchString(host) || strings.HasSuffix(host, ".javdb.com")
+}
+
+func normalizeMirrorBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return "", fmt.Errorf("invalid JavDB mirror base URL")
+	}
+	return strings.TrimRight(trimmed, "/"), nil
+}
+
+func parseMirrorBool(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on", "y":
+		return true, nil
+	case "0", "false", "no", "off", "n":
+		return false, nil
+	default:
+		return strconv.ParseBool(strings.TrimSpace(value))
+	}
+}
 
 func parseWesternSearchInterval(value string) (time.Duration, time.Duration, error) {
 	value = strings.TrimSpace(value)
@@ -130,8 +176,17 @@ type JavDB struct {
 	cookieCloudTimeout     time.Duration
 	cookieCloudLastAttempt time.Time
 	cookieCloudLastSuccess time.Time
+	cookieCloudLastFailure time.Time
 	cookieCloudLoaded      bool
 	cookieCloudLastError   error
+
+	mirrorMu         sync.Mutex
+	mirrorEnabled    bool
+	mirrorBaseURL    string
+	mirrorProxy      string
+	mirrorTimeout    time.Duration
+	mirrorConfigured bool
+	mirror           javDBMirror
 
 	browserTransport *chrometransport.Transport
 }
@@ -166,8 +221,70 @@ func New() *JavDB {
 		),
 		movieURL:         movieURL,
 		searchURL:        searchURL,
+		mirrorEnabled:    defaultMirrorEnabled,
+		mirrorBaseURL:    defaultMirrorBaseURL,
+		mirrorTimeout:    defaultMirrorTimeout,
 		browserTransport: browserTransport,
 	}
+}
+
+// SetMirrorEnabled configures whether the public mirror is queried before
+// falling back to the JavDB origin scraper.
+func (jdb *JavDB) SetMirrorEnabled(enabled bool) {
+	jdb.mirrorMu.Lock()
+	jdb.mirrorEnabled = enabled
+	jdb.mirrorConfigured = true
+	if !enabled {
+		jdb.mirror = nil
+	}
+	jdb.mirrorMu.Unlock()
+}
+
+func (jdb *JavDB) setMirrorClient(m javDBMirror) {
+	jdb.mirrorMu.Lock()
+	jdb.mirror = m
+	jdb.mirrorEnabled = m != nil
+	jdb.mirrorConfigured = true
+	jdb.mirrorMu.Unlock()
+}
+
+func (jdb *JavDB) shouldUseMirror(targetOriginURL string) bool {
+	jdb.mirrorMu.Lock()
+	enabled := jdb.mirrorEnabled
+	configured := jdb.mirrorConfigured || jdb.mirror != nil
+	jdb.mirrorMu.Unlock()
+	if !enabled {
+		return false
+	}
+	if configured {
+		return true
+	}
+	return isJavDBOriginURL(targetOriginURL)
+}
+
+func (jdb *JavDB) getMirrorClient() (javDBMirror, error) {
+	jdb.mirrorMu.Lock()
+	defer jdb.mirrorMu.Unlock()
+	if !jdb.mirrorEnabled {
+		return nil, nil
+	}
+	if jdb.mirror != nil {
+		return jdb.mirror, nil
+	}
+	base := strings.TrimSpace(jdb.mirrorBaseURL)
+	if base == "" {
+		base = defaultMirrorBaseURL
+	}
+	timeout := jdb.mirrorTimeout
+	if timeout <= 0 {
+		timeout = defaultMirrorTimeout
+	}
+	client, err := newMirrorClient(base, jdb.mirrorProxy, timeout)
+	if err != nil {
+		return nil, err
+	}
+	jdb.mirror = client
+	return client, nil
 }
 
 func (jdb *JavDB) getWesternLimiter() *WesternSearchLimiter {
@@ -211,6 +328,10 @@ func (jdb *JavDB) SetProxy(proxyURL string) error {
 	jdb.cookieCloudProxy = proxyURL
 	jdb.cookieCloudHTTPClient = nil
 	jdb.cookieCloudMu.Unlock()
+	jdb.mirrorMu.Lock()
+	jdb.mirrorProxy = proxyURL
+	jdb.mirror = nil
+	jdb.mirrorMu.Unlock()
 	return nil
 }
 
@@ -246,6 +367,9 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_REFRESH_INTERVAL (optional)
 //	MT_MOVIE_PROVIDER_JAVDB__COOKIECLOUD_USER_AGENT (optional; TLS fingerprint stays Chrome 150)
 //	MT_MOVIE_PROVIDER_JAVDB__BASE_URL (optional, defaults to https://javdb.com/)
+//	MT_MOVIE_PROVIDER_JAVDB__MIRROR_ENABLED (optional, defaults to true)
+//	MT_MOVIE_PROVIDER_JAVDB__MIRROR_BASE_URL (optional, defaults to https://jdforrepam.com/api)
+//	MT_MOVIE_PROVIDER_JAVDB__MIRROR_TIMEOUT (optional, defaults to 8s)
 //	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, a duration or
 //		a range such as 10s-20s; default 10s-20s)
 //
@@ -254,6 +378,47 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 func (jdb *JavDB) SetConfig(config provider.Config) error {
 	if config == nil {
 		return nil
+	}
+	var mirrorEnabled *bool
+	if value, ok := configValue(config, "mirror_enabled", "javdb_mirror_enabled"); ok && value != "" {
+		enabled, err := parseMirrorBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid JavDB mirror enabled setting")
+		}
+		mirrorEnabled = &enabled
+	}
+	var mirrorBase string
+	var mirrorBaseConfigured bool
+	if value, ok := configValue(config, "mirror_base_url", "javdb_mirror_base_url"); ok && value != "" {
+		var err error
+		mirrorBase, err = normalizeMirrorBaseURL(value)
+		if err != nil {
+			return err
+		}
+		mirrorBaseConfigured = true
+	}
+	var mirrorTimeout time.Duration
+	if value, ok := configValue(config, "mirror_timeout", "javdb_mirror_timeout"); ok && value != "" {
+		var err error
+		mirrorTimeout, err = time.ParseDuration(value)
+		if err != nil || mirrorTimeout <= 0 {
+			return fmt.Errorf("invalid JavDB mirror timeout")
+		}
+	}
+	if mirrorEnabled != nil || mirrorBaseConfigured || mirrorTimeout > 0 {
+		jdb.mirrorMu.Lock()
+		if mirrorEnabled != nil {
+			jdb.mirrorEnabled = *mirrorEnabled
+		}
+		if mirrorBaseConfigured {
+			jdb.mirrorBaseURL = mirrorBase
+			jdb.mirrorConfigured = true
+		}
+		if mirrorTimeout > 0 {
+			jdb.mirrorTimeout = mirrorTimeout
+		}
+		jdb.mirror = nil
+		jdb.mirrorMu.Unlock()
 	}
 	if value, ok := configValue(config, "javdb_western_search_interval", "western_search_interval"); ok && value != "" {
 		minInterval, maxInterval, err := parseWesternSearchInterval(value)
@@ -309,6 +474,7 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 	}
 	jdb.cookieCloudLastAttempt = time.Time{}
 	jdb.cookieCloudLastSuccess = time.Time{}
+	jdb.cookieCloudLastFailure = time.Time{}
 	jdb.cookieCloudLoaded = false
 	jdb.cookieCloudLastError = nil
 	jdb.cookieCloudHTTPClient = nil
@@ -360,15 +526,14 @@ func (jdb *JavDB) refreshCookieCloudLocked(now time.Time, force bool) error {
 	jdb.cookieCloud.httpClient = jdb.cookieCloudHTTPClientLocked()
 	cookies, err := jdb.cookieCloud.fetchCookies()
 	if err != nil {
-		jdb.cookieCloudLastError = err
+		err = jdb.recordCookieCloudRefreshFailure(err)
 		if !force && jdb.cookieCloudLoaded {
 			return nil
 		}
 		return err
 	}
 	if len(cookies) == 0 {
-		err = fmt.Errorf("CookieCloud contains no JavDB cookies")
-		jdb.cookieCloudLastError = err
+		err = jdb.recordCookieCloudRefreshFailure(fmt.Errorf("CookieCloud contains no JavDB cookies"))
 		if !force && jdb.cookieCloudLoaded {
 			return nil
 		}
@@ -381,17 +546,24 @@ func (jdb *JavDB) refreshCookieCloudLocked(now time.Time, force bool) error {
 		}
 		cookieURL := "https://" + domain + "/"
 		if err = jdb.SetCookies(cookieURL, []*http.Cookie{cookie}); err != nil {
-			jdb.cookieCloudLastError = fmt.Errorf("apply CookieCloud cookies: %w", err)
+			err = jdb.recordCookieCloudRefreshFailure(fmt.Errorf("apply CookieCloud cookies: %w", err))
 			if !force && jdb.cookieCloudLoaded {
 				return nil
 			}
-			return jdb.cookieCloudLastError
+			return err
 		}
 	}
 	jdb.cookieCloudLoaded = true
 	jdb.cookieCloudLastSuccess = now
+	jdb.cookieCloudLastFailure = time.Time{}
 	jdb.cookieCloudLastError = nil
 	return nil
+}
+
+func (jdb *JavDB) recordCookieCloudRefreshFailure(err error) error {
+	jdb.cookieCloudLastFailure = time.Now()
+	jdb.cookieCloudLastError = err
+	return err
 }
 
 // ensureCookieCloudCookies refreshes the CookieCloud session lazily. A
@@ -431,6 +603,13 @@ func (jdb *JavDB) forceCookieCloudRefresh(attemptStart time.Time) error {
 	if !attemptStart.IsZero() && jdb.cookieCloudLastSuccess.After(attemptStart) {
 		return nil
 	}
+	if !jdb.cookieCloudLastFailure.IsZero() &&
+		((!attemptStart.IsZero() && jdb.cookieCloudLastFailure.After(attemptStart)) || time.Since(jdb.cookieCloudLastFailure) < 5*time.Second) {
+		if jdb.cookieCloudLastError != nil {
+			return jdb.cookieCloudLastError
+		}
+		return errors.New("CookieCloud refresh recently failed")
+	}
 	return jdb.refreshCookieCloudLocked(time.Now(), true)
 }
 
@@ -445,6 +624,150 @@ func isForbidden(statusCode int, err error) bool {
 		}
 	}
 	return false
+}
+
+func isJavDBLoginURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	switch path.Clean(strings.ToLower(parsed.Path)) {
+	case "/login", "/signin", "/sign_in", "/users/login", "/users/sign_in", "/accounts/login":
+		return true
+	default:
+		return false
+	}
+}
+
+func htmlAttribute(node *html.Node, name string) string {
+	if node == nil {
+		return ""
+	}
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, name) {
+			return attr.Val
+		}
+	}
+	return ""
+}
+
+func loginFormContainsCredentials(form *html.Node) bool {
+	action := strings.ToLower(htmlAttribute(form, "action"))
+	formID := strings.ToLower(htmlAttribute(form, "id"))
+	formClass := strings.ToLower(htmlAttribute(form, "class"))
+	loginMarker := strings.Contains(action, "login") || strings.Contains(formID, "login") || strings.Contains(formClass, "login")
+	hasPassword, hasIdentity := false, false
+	var visit func(*html.Node)
+	visit = func(node *html.Node) {
+		if node.Type == html.ElementNode && strings.EqualFold(node.Data, "input") {
+			inputType := strings.ToLower(htmlAttribute(node, "type"))
+			name := strings.ToLower(htmlAttribute(node, "name"))
+			autocomplete := strings.ToLower(htmlAttribute(node, "autocomplete"))
+			if inputType == "password" {
+				hasPassword = true
+			}
+			if inputType == "email" || strings.Contains(autocomplete, "username") ||
+				name == "username" || name == "user" || name == "account" ||
+				name == "email" || name == "login" {
+				hasIdentity = true
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			visit(child)
+		}
+	}
+	visit(form)
+	return hasPassword && (hasIdentity || loginMarker)
+}
+
+func containsJavDBLoginForm(node *html.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Type == html.ElementNode && strings.EqualFold(node.Data, "form") && loginFormContainsCredentials(node) {
+		return true
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if containsJavDBLoginForm(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func isJavDBLoginResponse(response *colly.Response) bool {
+	if response == nil {
+		return false
+	}
+	if response.Headers != nil && response.StatusCode >= 300 && response.StatusCode < 400 {
+		location := response.Headers.Get("Location")
+		if location != "" {
+			if response.Request != nil && response.Request.URL != nil {
+				if parsedLocation, err := response.Request.URL.Parse(location); err == nil {
+					location = parsedLocation.String()
+				}
+			}
+			if isJavDBLoginURL(location) {
+				return true
+			}
+		}
+	}
+	if response.Request != nil && response.Request.URL != nil && isJavDBLoginURL(response.Request.URL.String()) {
+		return true
+	}
+	if len(response.Body) == 0 {
+		return false
+	}
+	document, err := html.Parse(strings.NewReader(string(response.Body)))
+	if err != nil || hasJavDBMovieContent(document) {
+		return false
+	}
+	return containsJavDBLoginForm(document)
+}
+
+func hasJavDBMovieContent(document *html.Node) bool {
+	if document == nil {
+		return false
+	}
+	if len(htmlquery.Find(document, `//div[contains(@class,"video-detail")]//h2[contains(@class,"title")]//strong[1]`)) > 0 &&
+		len(htmlquery.Find(document, `//div[contains(@class,"column-video-cover")]//img[1]`)) > 0 {
+		return true
+	}
+	return len(htmlquery.Find(document, `//div[contains(@class,"movie-list")]//div[contains(@class,"item")]/a[contains(@class,"box")]`)) > 0
+}
+
+func javDBRequestError(statusCode int, err error) error {
+	if err != nil {
+		return err
+	}
+	if statusCode == http.StatusForbidden {
+		return errors.New(http.StatusText(http.StatusForbidden))
+	}
+	return nil
+}
+
+func isSessionRecoveryError(statusCode int, err error) bool {
+	return isForbidden(statusCode, err) || errors.Is(err, ErrLoginRequired)
+}
+
+func (jdb *JavDB) refreshSessionAfterFailure(attemptStart time.Time, attemptErr error) (bool, error) {
+	if !jdb.isCookieCloudConfigured() {
+		return false, attemptErr
+	}
+	reason := "403 response"
+	if errors.Is(attemptErr, ErrLoginRequired) {
+		reason = "login page"
+	}
+	log.Printf("JavDB origin returned a %s; refreshing CookieCloud session", reason)
+	if err := jdb.forceCookieCloudRefresh(attemptStart); err != nil {
+		log.Printf("JavDB CookieCloud session refresh failed; returning the origin error")
+		if attemptErr != nil {
+			return false, fmt.Errorf("%w (CookieCloud refresh failed: %v)", attemptErr, err)
+		}
+		return false, err
+	}
+	log.Printf("JavDB CookieCloud session refreshed; retrying the origin once")
+	return true, nil
 }
 
 // JavDB uses a case-sensitive opaque ID in /v/<id> URLs.
@@ -489,6 +812,12 @@ func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error
 	c := jdb.ClonedCollector()
 
 	var statusCode int
+	var loginRequired bool
+	c.OnResponse(func(r *colly.Response) {
+		if isJavDBLoginResponse(r) {
+			loginRequired = true
+		}
+	})
 	c.OnError(func(r *colly.Response, err error) {
 		if r != nil {
 			statusCode = r.StatusCode
@@ -558,6 +887,9 @@ func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error
 	})
 
 	err = c.Visit(info.Homepage)
+	if loginRequired {
+		return nil, statusCode, ErrLoginRequired
+	}
 	if err != nil {
 		return nil, statusCode, err
 	}
@@ -565,30 +897,46 @@ func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error
 }
 
 func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
+	id, err := jdb.ParseMovieIDFromURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if jdb.shouldUseMirror(rawURL) {
+		if mirror, mirrorErr := jdb.getMirrorClient(); mirrorErr == nil && mirror != nil {
+			info, mirrorErr := mirror.GetMovieInfoByID(id)
+			if mirrorErr == nil && info != nil && info.ID == id && info.IsValid() {
+				log.Printf("JavDB mirror detail lookup hit")
+				return info, nil
+			}
+		}
+		log.Printf("JavDB mirror detail lookup missed; using origin")
+	}
+	return jdb.getMovieInfoByURLWithRecovery(rawURL)
+}
+
+func (jdb *JavDB) getMovieInfoByURLWithRecovery(rawURL string) (*model.MovieInfo, error) {
 	if err := jdb.ensureCookieCloudCookies(); err != nil {
 		return nil, err
 	}
 	attemptStart := time.Now()
 	info, statusCode, err := jdb.getMovieInfoByURL(rawURL)
-	if isForbidden(statusCode, err) {
-		if err == nil {
-			err = errors.New(http.StatusText(http.StatusForbidden))
+	firstErr := javDBRequestError(statusCode, err)
+	if isSessionRecoveryError(statusCode, firstErr) {
+		refreshed, refreshErr := jdb.refreshSessionAfterFailure(attemptStart, firstErr)
+		if refreshErr != nil {
+			return nil, refreshErr
 		}
-		if jdb.isCookieCloudConfigured() {
-			if refreshErr := jdb.forceCookieCloudRefresh(attemptStart); refreshErr == nil {
-				infoRetry, statusCodeRetry, retryErr := jdb.getMovieInfoByURL(rawURL)
-				if isForbidden(statusCodeRetry, retryErr) && retryErr == nil {
-					retryErr = errors.New(http.StatusText(http.StatusForbidden))
-				}
-				if retryErr != nil {
-					return nil, retryErr
-				}
-				return infoRetry, nil
+		if refreshed {
+			infoRetry, statusCodeRetry, retryErr := jdb.getMovieInfoByURL(rawURL)
+			retryErr = javDBRequestError(statusCodeRetry, retryErr)
+			if retryErr != nil {
+				return nil, retryErr
 			}
+			return infoRetry, nil
 		}
 	}
-	if err != nil {
-		return nil, err
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return info, nil
 }
@@ -602,6 +950,12 @@ func (jdb *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, int, 
 	c := jdb.ClonedCollector()
 
 	var statusCode int
+	var loginRequired bool
+	c.OnResponse(func(r *colly.Response) {
+		if isJavDBLoginResponse(r) {
+			loginRequired = true
+		}
+	})
 	c.OnError(func(r *colly.Response, err error) {
 		if r != nil {
 			statusCode = r.StatusCode
@@ -632,6 +986,9 @@ func (jdb *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, int, 
 		endpoint = searchURL
 	}
 	err := c.Visit(fmt.Sprintf(endpoint, url.QueryEscape(keyword)))
+	if loginRequired {
+		return nil, statusCode, ErrLoginRequired
+	}
 	if err != nil {
 		return nil, statusCode, err
 	}
@@ -639,33 +996,41 @@ func (jdb *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, int, 
 }
 
 func (jdb *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error) {
-	if number.IsWestern(keyword) {
-		jdb.getWesternLimiter().Wait()
+	if jdb.shouldUseMirror(jdb.searchURL) {
+		if mirror, mirrorErr := jdb.getMirrorClient(); mirrorErr == nil && mirror != nil {
+			results, mirrorErr := mirror.SearchMovie(keyword)
+			if mirrorErr == nil && len(results) > 0 {
+				log.Printf("JavDB mirror search hit")
+				return results, nil
+			}
+		}
+		log.Printf("JavDB mirror search missed; using origin")
 	}
 	if err := jdb.ensureCookieCloudCookies(); err != nil {
 		return nil, err
 	}
+	if number.IsWestern(keyword) {
+		jdb.getWesternLimiter().Wait()
+	}
 	attemptStart := time.Now()
 	results, statusCode, err := jdb.searchMovie(keyword)
-	if isForbidden(statusCode, err) {
-		if err == nil {
-			err = errors.New(http.StatusText(http.StatusForbidden))
+	firstErr := javDBRequestError(statusCode, err)
+	if isSessionRecoveryError(statusCode, firstErr) {
+		refreshed, refreshErr := jdb.refreshSessionAfterFailure(attemptStart, firstErr)
+		if refreshErr != nil {
+			return nil, refreshErr
 		}
-		if jdb.isCookieCloudConfigured() {
-			if refreshErr := jdb.forceCookieCloudRefresh(attemptStart); refreshErr == nil {
-				resultsRetry, statusCodeRetry, retryErr := jdb.searchMovie(keyword)
-				if isForbidden(statusCodeRetry, retryErr) && retryErr == nil {
-					retryErr = errors.New(http.StatusText(http.StatusForbidden))
-				}
-				if retryErr != nil {
-					return nil, retryErr
-				}
-				return resultsRetry, nil
+		if refreshed {
+			resultsRetry, statusCodeRetry, retryErr := jdb.searchMovie(keyword)
+			retryErr = javDBRequestError(statusCodeRetry, retryErr)
+			if retryErr != nil {
+				return nil, retryErr
 			}
+			return resultsRetry, nil
 		}
 	}
-	if err != nil {
-		return nil, err
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return results, nil
 }

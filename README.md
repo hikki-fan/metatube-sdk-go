@@ -66,6 +66,42 @@ Only cookies for `javdb.com`, an approved `javdb<digits>.com` mirror (and
 their subdomains), or `jdbstatic.com` (and its subdomains) are imported.
 Credentials stay in memory and are never logged or persisted by the SDK.
 
+### JavDB mirror lookup (enabled by default)
+
+The JavDB movie provider queries the backend mirror first and falls back to
+the JavDB origin site only when the mirror fails, returns no data, or returns
+an incomplete record. If the origin site answers with HTTP 403 or redirects to
+the login page (302), MetaTube synchronizes the browser session from the
+configured CookieCloud server (see above) and retries that origin request
+exactly once.
+
+```sh
+# Optional; both shown values are the defaults:
+MT_MOVIE_PROVIDER_JAVDB__MIRROR_ENABLED=true
+MT_MOVIE_PROVIDER_JAVDB__MIRROR_BASE_URL=https://jdforrepam.com/api
+MT_MOVIE_PROVIDER_JAVDB__MIRROR_TIMEOUT=8s
+```
+
+Notes:
+
+- The mirror never receives origin-site cookies or auth headers; it is a plain
+  public API. The CookieCloud session is only used for origin-site requests.
+- For mirror queries only, `FC2-PPV-<number>` is normalized to
+  `FC2-<number>`. Media file naming, library scanning, and ProviderId handling
+  are unchanged.
+- This is a backend mirror only. No source files need to be renamed, the
+  existing Emby ProviderId format is unaffected, and neither the plugin UI nor
+  AutoFilm download/organization configuration needs any change.
+- Cookie synchronization cannot re-login on your behalf. If the origin site
+  still denies access after a refresh, sync a valid logged-in browser session
+  via CookieCloud (confirm the session can browse the site in the browser
+  first).
+- To disable the mirror and roll back to origin-only lookups, set
+  `MT_MOVIE_PROVIDER_JAVDB__MIRROR_ENABLED=false`. Existing cached metadata
+  may take priority over network results; force a metadata refresh in the
+  client after changing this setting. See
+  [docs/javdb-mirror.md](docs/javdb-mirror.md) for troubleshooting.
+
 ### AV-LEAGUE actor enrichment
 
 AV-LEAGUE is the primary Japanese JAV actor provider. When an AV-LEAGUE
