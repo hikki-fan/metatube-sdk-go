@@ -60,6 +60,12 @@ type MovieProvider interface {
 	GetMovieInfoByURL(url string) (*model.MovieInfo, error)
 }
 
+// MovieImageFallbackProvider optionally provides image URLs from the
+// provider's own movie page when the normal image URL cannot be decoded.
+type MovieImageFallbackProvider interface {
+	GetMovieImageFallbackURLsByID(id string) ([]string, error)
+}
+
 type ActorSearcher interface {
 	// SearchActor searches matched actor/s.
 	SearchActor(keyword string) ([]*model.ActorSearchResult, error)

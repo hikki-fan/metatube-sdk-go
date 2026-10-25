@@ -1,5 +1,8 @@
 name: Publish Go Releases
 
+permissions:
+  contents: write
+
 concurrency:
   group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -45,5 +48,5 @@ jobs:
           files: build/*
           draft: false
           prerelease: false
-          repository: metatube-community/metatube-server-releases
-          token: ${{ secrets.ORG_PAT }}
+          repository: ${{ github.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}

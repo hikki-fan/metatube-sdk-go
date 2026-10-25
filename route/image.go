@@ -84,17 +84,25 @@ func getImage(app *engine.Engine, typ imageType) gin.HandlerFunc {
 			err error
 		)
 		if query.URL != "" /* specified URL */ {
-			var provider mt.Provider
 			if isActorProvider {
-				provider = app.MustGetActorProviderByName(uri.Provider)
+				// query.Ratio should apply only to the primary images.
+				if typ != primaryImageType || query.Ratio < 0 {
+					query.Ratio = ratio
+				}
+				img, err = app.GetImageByURL(
+					app.MustGetActorProviderByName(uri.Provider), query.URL,
+					query.Ratio, query.Position, query.Auto,
+				)
 			} else {
-				provider = app.MustGetMovieProviderByName(uri.Provider)
+				// query.Ratio should apply only to the primary images.
+				if typ != primaryImageType || query.Ratio < 0 {
+					query.Ratio = ratio
+				}
+				img, err = app.GetMovieImageByURL(
+					uri.AsProviderID(), query.URL,
+					query.Ratio, query.Position, query.Auto,
+				)
 			}
-			// query.Ratio should apply only to the primary images.
-			if typ != primaryImageType || query.Ratio < 0 {
-				query.Ratio = ratio
-			}
-			img, err = app.GetImageByURL(provider, query.URL, query.Ratio, query.Position, query.Auto)
 		} else if isActorProvider /* actor */ {
 			switch typ {
 			case primaryImageType:

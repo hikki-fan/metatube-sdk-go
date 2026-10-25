@@ -29,11 +29,12 @@ import (
 )
 
 var (
-	_ provider.MovieProvider        = (*JavDB)(nil)
-	_ provider.MovieSearcher        = (*JavDB)(nil)
-	_ provider.Fetcher              = (*JavDB)(nil)
-	_ provider.ProxySetter          = (*JavDB)(nil)
-	_ provider.RequestTimeoutSetter = (*JavDB)(nil)
+	_ provider.MovieProvider              = (*JavDB)(nil)
+	_ provider.MovieImageFallbackProvider = (*JavDB)(nil)
+	_ provider.MovieSearcher              = (*JavDB)(nil)
+	_ provider.Fetcher                    = (*JavDB)(nil)
+	_ provider.ProxySetter                = (*JavDB)(nil)
+	_ provider.RequestTimeoutSetter       = (*JavDB)(nil)
 )
 
 const (
@@ -188,6 +189,10 @@ type JavDB struct {
 	mirrorConfigured bool
 	mirror           javDBMirror
 
+	imageFallbackMu    sync.Mutex
+	imageFallbackCache map[string]javDBImageFallbackCacheEntry
+	imageFallbackCalls map[string]*javDBImageFallbackCall
+
 	browserTransport *chrometransport.Transport
 }
 
@@ -219,12 +224,14 @@ func New() *JavDB {
 			DefaultWesternSearchMinInterval,
 			DefaultWesternSearchMaxInterval,
 		),
-		movieURL:         movieURL,
-		searchURL:        searchURL,
-		mirrorEnabled:    defaultMirrorEnabled,
-		mirrorBaseURL:    defaultMirrorBaseURL,
-		mirrorTimeout:    defaultMirrorTimeout,
-		browserTransport: browserTransport,
+		movieURL:           movieURL,
+		searchURL:          searchURL,
+		mirrorEnabled:      defaultMirrorEnabled,
+		mirrorBaseURL:      defaultMirrorBaseURL,
+		mirrorTimeout:      defaultMirrorTimeout,
+		imageFallbackCache: make(map[string]javDBImageFallbackCacheEntry),
+		imageFallbackCalls: make(map[string]*javDBImageFallbackCall),
+		browserTransport:   browserTransport,
 	}
 }
 
@@ -795,6 +802,13 @@ func (jdb *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 }
 
 func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error) {
+	return jdb.getMovieInfoByURLWithFinalURL(rawURL, nil)
+}
+
+func (jdb *JavDB) getMovieInfoByURLWithFinalURL(rawURL string, finalURL *string) (*model.MovieInfo, int, error) {
+	if finalURL != nil {
+		*finalURL = ""
+	}
 	id, err := jdb.ParseMovieIDFromURL(rawURL)
 	if err != nil {
 		return nil, 0, err
@@ -814,6 +828,9 @@ func (jdb *JavDB) getMovieInfoByURL(rawURL string) (*model.MovieInfo, int, error
 	var statusCode int
 	var loginRequired bool
 	c.OnResponse(func(r *colly.Response) {
+		if finalURL != nil && r != nil && r.Request != nil && r.Request.URL != nil {
+			*finalURL = r.Request.URL.String()
+		}
 		if isJavDBLoginResponse(r) {
 			loginRequired = true
 		}
@@ -915,11 +932,18 @@ func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
 }
 
 func (jdb *JavDB) getMovieInfoByURLWithRecovery(rawURL string) (*model.MovieInfo, error) {
+	return jdb.getMovieInfoByURLWithRecoveryAndFinalURL(rawURL, nil)
+}
+
+func (jdb *JavDB) getMovieInfoByURLWithRecoveryAndFinalURL(rawURL string, finalURL *string) (*model.MovieInfo, error) {
+	if finalURL != nil {
+		*finalURL = ""
+	}
 	if err := jdb.ensureCookieCloudCookies(); err != nil {
 		return nil, err
 	}
 	attemptStart := time.Now()
-	info, statusCode, err := jdb.getMovieInfoByURL(rawURL)
+	info, statusCode, err := jdb.getMovieInfoByURLWithFinalURL(rawURL, finalURL)
 	firstErr := javDBRequestError(statusCode, err)
 	if isSessionRecoveryError(statusCode, firstErr) {
 		refreshed, refreshErr := jdb.refreshSessionAfterFailure(attemptStart, firstErr)
@@ -927,7 +951,7 @@ func (jdb *JavDB) getMovieInfoByURLWithRecovery(rawURL string) (*model.MovieInfo
 			return nil, refreshErr
 		}
 		if refreshed {
-			infoRetry, statusCodeRetry, retryErr := jdb.getMovieInfoByURL(rawURL)
+			infoRetry, statusCodeRetry, retryErr := jdb.getMovieInfoByURLWithFinalURL(rawURL, finalURL)
 			retryErr = javDBRequestError(statusCodeRetry, retryErr)
 			if retryErr != nil {
 				return nil, retryErr
