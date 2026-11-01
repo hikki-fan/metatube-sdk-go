@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"image"
+	"net/url"
 	"strings"
 
 	"github.com/metatube-community/metatube-sdk-go/common/number"
@@ -150,8 +151,20 @@ func (e *Engine) getImageByURL(provider mt.Provider, url string) (img image.Imag
 		return
 	}
 	defer resp.Body.Close()
+	if shouldDecodeJavDBImage(provider, url) {
+		img, _, err = imageutil.DecodeJavDB(resp.Body)
+		return
+	}
 	img, _, err = imageutil.Decode(resp.Body)
 	return
+}
+
+func shouldDecodeJavDBImage(provider mt.Provider, rawURL string) bool {
+	if provider == nil || (provider.Name() != "JavDB" && provider.Name() != "JavDBActor") {
+		return false
+	}
+	parsed, err := url.Parse(rawURL)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "tp.spfcas.com")
 }
 
 func (e *Engine) getPreferredMovieImageURLAndInfo(pid providerid.ProviderID, thumb bool) (url string, info *model.MovieInfo, err error) {

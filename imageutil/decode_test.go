@@ -29,7 +29,11 @@ func TestJPEGDecode(t *testing.T) {
 
 	var jpegErr jpeg.UnsupportedError
 	_, err = jpeg.Decode(bytes.NewReader(data))
-	require.ErrorAs(t, err, &jpegErr)
+	// Newer Go releases can decode this JPEG directly. Older releases must
+	// report the unsupported form that our JPEGli fallback handles.
+	if err != nil {
+		require.ErrorAs(t, err, &jpegErr)
+	}
 
 	_, err = jpegli.Decode(bytes.NewReader(data))
 	require.NoError(t, err)
