@@ -2,12 +2,14 @@ package engine
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"path"
 	"strings"
@@ -23,8 +25,10 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/collection/maps"
 	"github.com/metatube-community/metatube-sdk-go/database"
 	"github.com/metatube-community/metatube-sdk-go/engine/providerid"
+	"github.com/metatube-community/metatube-sdk-go/internal/envconfig"
 	"github.com/metatube-community/metatube-sdk-go/model"
 	mt "github.com/metatube-community/metatube-sdk-go/provider"
+	"github.com/metatube-community/metatube-sdk-go/provider/javdb"
 )
 
 const imageFallbackProviderName = "ImageFallbackTest"
@@ -71,6 +75,20 @@ func (p *imageFallbackMovieProvider) Fetch(rawURL string) (*http.Response, error
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(bytes.NewReader(p.responses[rawURL])),
+		Header:     make(http.Header),
+	}, nil
+}
+
+type javDBImagePipelineProvider struct {
+	*javdb.JavDB
+	fetches atomic.Int32
+}
+
+func (p *javDBImagePipelineProvider) Fetch(string) (*http.Response, error) {
+	p.fetches.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("not an image")),
 		Header:     make(http.Header),
 	}, nil
 }
@@ -170,6 +188,54 @@ func TestMovieImageFallbackRunsForPrimaryThumbBackdropAndExplicitURL(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, image.Rect(20, 0, 60, 60), explicit.Bounds())
 	assert.EqualValues(t, 4, provider.fallbacks.Load())
+}
+
+func TestJavDBMirrorOnlyImagePipelineDoesNotRequestOrigin(t *testing.T) {
+	const movieID = "MirrorImageID"
+	var mirrorRequests atomic.Int32
+	var originRequests atomic.Int32
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			originRequests.Add(1)
+			http.Error(w, "origin request blocked by test proxy", http.StatusBadGateway)
+			return
+		}
+		if r.URL.Hostname() != "mirror.test" {
+			http.Error(w, "unexpected proxy destination", http.StatusBadGateway)
+			return
+		}
+		mirrorRequests.Add(1)
+		if r.URL.Path != "/api/v4/movies/"+movieID {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": 1,
+			"data": map[string]any{"movie": map[string]any{
+				"id": movieID, "type": 0, "number": "ABP-123", "title": "Mirror image test",
+				"cover_url": "https://images.example/broken.jpg",
+			}},
+		})
+	}))
+	t.Cleanup(proxyServer.Close)
+
+	config := envconfig.NewConfig()
+	config.Set("mirror_base_url", "http://mirror.test/api")
+	config.Set("mirror_timeout", "1s")
+	imageProvider := &javDBImagePipelineProvider{JavDB: javdb.New()}
+	require.NoError(t, imageProvider.SetConfig(config))
+	require.NoError(t, imageProvider.SetProxy(proxyServer.URL))
+
+	app := newImageFallbackEngine(t, imageProvider, nil)
+	pid := providerid.ProviderID{Provider: "JavDB", ID: movieID}
+	img, err := app.GetMoviePrimaryImage(pid, -1, -1)
+	require.Error(t, err)
+	assert.Nil(t, img)
+	assert.ErrorContains(t, err, javdb.ErrMirrorOriginDisabled.Error())
+	assert.Equal(t, int32(1), mirrorRequests.Load())
+	assert.Equal(t, int32(1), imageProvider.fetches.Load())
+	assert.Zero(t, originRequests.Load())
 }
 
 func TestMovieImageFallbackDoesNotRunWhenMirrorImageDecodes(t *testing.T) {

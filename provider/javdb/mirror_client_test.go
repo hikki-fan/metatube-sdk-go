@@ -140,6 +140,52 @@ func TestMirrorClientSearchNormalizesFC2AndFetchesExactDetail(t *testing.T) {
 	assert.Equal(t, int32(1), detailRequests.Load())
 }
 
+func TestMirrorClientPreservesProviderIdentityAcrossMovieFamilies(t *testing.T) {
+	tests := []struct {
+		name       string
+		number     string
+		movieType  int
+		providerID string
+	}{
+		{name: "JAV", number: "ABP-123", movieType: 0, providerID: "JavMixedID"},
+		{name: "UN", number: "HEYZO-1234", movieType: 1, providerID: "UnMixedID"},
+		{name: "EU", number: "STUDIO.24.01.02", movieType: 2, providerID: "EuMixedID"},
+		{name: "FC2", number: "FC2-3972042", movieType: 3, providerID: "Fc2MixedID"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			movie := mirrorTestMovie(test.providerID, test.number, test.movieType)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v2/search":
+					mirrorTestWriteJSON(w, map[string]any{
+						"success": 1,
+						"data":    map[string]any{"movies": []map[string]any{movie}},
+					})
+				case "/v4/movies/" + test.providerID:
+					mirrorTestWriteJSON(w, map[string]any{
+						"success": 1,
+						"data":    map[string]any{"movie": movie},
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(server.Close)
+			client, err := newMirrorClient(server.URL, "", time.Second)
+			require.NoError(t, err)
+
+			results, err := client.SearchMovie(test.number)
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			assert.Equal(t, test.providerID, results[0].ID)
+			assert.Equal(t, test.number, results[0].Number)
+			assert.Equal(t, "JavDB", results[0].Provider)
+			assert.Equal(t, "https://javdb.com/v/"+test.providerID, results[0].Homepage)
+		})
+	}
+}
+
 func TestMirrorClientSearchKeepsFullNumberIdentity(t *testing.T) {
 	var detailRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

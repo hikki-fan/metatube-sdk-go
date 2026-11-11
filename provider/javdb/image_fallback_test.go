@@ -33,6 +33,12 @@ func (m *countingJavDBMirror) GetMovieInfoByID(string) (*model.MovieInfo, error)
 	return nil, nil
 }
 
+func enableJavDBMirrorFallback(jdb *JavDB) {
+	jdb.mirrorMu.Lock()
+	jdb.mirrorMode = mirrorModeFallback
+	jdb.mirrorMu.Unlock()
+}
+
 func TestJavDBMovieImageFallbackUsesOriginAndCachesProjection(t *testing.T) {
 	var originRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +50,7 @@ func TestJavDBMovieImageFallbackUsesOriginAndCachesProjection(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	jdb := New()
+	enableJavDBMirrorFallback(jdb)
 	jdb.movieURL = server.URL + "/v/%s"
 	mirror := &countingJavDBMirror{}
 	jdb.setMirrorClient(mirror)
@@ -63,6 +70,25 @@ func TestJavDBMovieImageFallbackUsesOriginAndCachesProjection(t *testing.T) {
 	require.True(t, ok)
 	assert.True(t, entry.expiresAt.After(time.Now()))
 	assert.Equal(t, []string{"https://images.example/origin-cover.jpg"}, entry.urls)
+}
+
+func TestJavDBMovieImageFallbackStopsInMirrorOnlyMode(t *testing.T) {
+	var originRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(imageFallbackMovieHTML))
+	}))
+	t.Cleanup(server.Close)
+
+	jdb := New()
+	jdb.movieURL = server.URL + "/v/%s"
+	mirror := &countingJavDBMirror{}
+	jdb.setMirrorClient(mirror)
+	_, err := jdb.GetMovieImageFallbackURLsByID("MirrorOnlyID")
+	require.ErrorIs(t, err, ErrMirrorOriginDisabled)
+	assert.Zero(t, originRequests.Load())
+	assert.Zero(t, mirror.calls.Load(), "image fallback must not trigger a metadata lookup")
 }
 
 func TestJavDBMovieImageFallbackRejectsRedirectToDifferentMovie(t *testing.T) {

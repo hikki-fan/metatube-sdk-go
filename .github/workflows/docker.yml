@@ -27,10 +27,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Set up Go for tag regression checks
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/setup-go@v6
         with:
-          platforms: all
+          check-latest: true
+          go-version-file: 'go.mod'
+
+      - name: Run tag regression checks
+        if: startsWith(github.ref, 'refs/tags/')
+        run: go test -short ./provider/javdb ./engine ./common/number ./internal/envconfig
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -47,7 +53,8 @@ jobs:
       - name: Get Version
         id: shell
         run: |
-          echo "version=$(git describe --abbrev=0 --tags HEAD | cut -d'v' -f 2)" >> $GITHUB_OUTPUT
+          version="$(git describe --abbrev=0 --tags HEAD)"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and Push (dev)
         if: github.ref == 'refs/heads/main'
@@ -56,7 +63,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: |
             ghcr.io/${{ github.repository_owner }}/metatube-server:dev
           cache-from: type=gha
@@ -69,7 +76,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: |
             ghcr.io/${{ github.repository_owner }}/metatube-server:latest
             ghcr.io/${{ github.repository_owner }}/metatube-server:${{ steps.shell.outputs.version }}

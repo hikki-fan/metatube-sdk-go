@@ -47,6 +47,17 @@ type JavDBActor struct {
 	searchEndpoint string
 	pageEndpoint   string
 
+	mirrorMu         sync.Mutex
+	mirrorEnabled    bool
+	mirrorBaseURL    string
+	mirrorProxy      string
+	mirrorTimeout    time.Duration
+	mirrorMode       string
+	mirrorUsername   string
+	mirrorPassword   string
+	mirrorConfigured bool
+	mirror           javDBActorMirror
+
 	cookieCloudMu          sync.Mutex
 	cookieCloud            *cookieCloudClient
 	cookieCloudProxy       string
@@ -86,8 +97,57 @@ func NewActor() *JavDBActor {
 			scraperOpts...),
 		searchEndpoint:   actorSearchURL,
 		pageEndpoint:     actorPageURL,
+		mirrorEnabled:    defaultMirrorEnabled,
+		mirrorBaseURL:    defaultMirrorBaseURL,
+		mirrorTimeout:    defaultMirrorTimeout,
+		mirrorMode:       defaultMirrorMode,
 		browserTransport: browserTransport,
 	}
+}
+
+func (jdb *JavDBActor) shouldUseMirror(targetOriginURL string) bool {
+	jdb.mirrorMu.Lock()
+	enabled := jdb.mirrorEnabled
+	configured := jdb.mirrorConfigured || jdb.mirror != nil
+	jdb.mirrorMu.Unlock()
+	if !enabled {
+		return false
+	}
+	return configured || isJavDBOriginURL(targetOriginURL)
+}
+
+func (jdb *JavDBActor) isMirrorOnly(targetOriginURL string) bool {
+	jdb.mirrorMu.Lock()
+	enabled := jdb.mirrorEnabled
+	configured := jdb.mirrorConfigured || jdb.mirror != nil
+	mode := jdb.mirrorMode
+	jdb.mirrorMu.Unlock()
+	return enabled && mode == mirrorModeOnly && (configured || isJavDBOriginURL(targetOriginURL))
+}
+
+func (jdb *JavDBActor) getMirrorClient() (javDBActorMirror, error) {
+	jdb.mirrorMu.Lock()
+	defer jdb.mirrorMu.Unlock()
+	if !jdb.mirrorEnabled {
+		return nil, nil
+	}
+	if jdb.mirror != nil {
+		return jdb.mirror, nil
+	}
+	base := strings.TrimSpace(jdb.mirrorBaseURL)
+	if base == "" {
+		base = defaultMirrorBaseURL
+	}
+	timeout := jdb.mirrorTimeout
+	if timeout <= 0 {
+		timeout = defaultMirrorTimeout
+	}
+	client, err := newMirrorClientWithCredentials(base, jdb.mirrorProxy, timeout, jdb.mirrorUsername, jdb.mirrorPassword)
+	if err != nil {
+		return nil, err
+	}
+	jdb.mirror = client
+	return client, nil
 }
 
 // SetProxy applies the provider proxy to JavDBActor page/image requests and
@@ -105,6 +165,10 @@ func (jdb *JavDBActor) SetProxy(proxyURL string) error {
 	jdb.cookieCloudProxy = proxyURL
 	jdb.cookieCloudHTTPClient = nil
 	jdb.cookieCloudMu.Unlock()
+	jdb.mirrorMu.Lock()
+	jdb.mirrorProxy = proxyURL
+	jdb.mirror = nil
+	jdb.mirrorMu.Unlock()
 	return nil
 }
 
@@ -137,9 +201,77 @@ func (jdb *JavDBActor) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_REFRESH_INTERVAL (optional)
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__COOKIECLOUD_USER_AGENT (optional; TLS fingerprint stays Chrome 150)
 //	MT_ACTOR_PROVIDER_JAVDBACTOR__BASE_URL (optional, defaults to https://javdb.com/)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__MIRROR_ENABLED (optional, defaults to true)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__MIRROR_BASE_URL (optional, defaults to https://jdforrepam.com/api)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__MIRROR_TIMEOUT (optional, defaults to 8s)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__MIRROR_MODE (optional, defaults to mirror-only)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__MIRROR_USERNAME (optional; requires MIRROR_PASSWORD)
+//	MT_ACTOR_PROVIDER_JAVDBACTOR__MIRROR_PASSWORD (optional; requires MIRROR_USERNAME)
 func (jdb *JavDBActor) SetConfig(config provider.Config) error {
 	if config == nil {
 		return nil
+	}
+	var mirrorEnabled *bool
+	if value, ok := configValue(config, "mirror_enabled", "javdb_mirror_enabled"); ok && value != "" {
+		enabled, err := parseMirrorBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid JavDBActor mirror enabled setting")
+		}
+		mirrorEnabled = &enabled
+	}
+	var mirrorBase string
+	var mirrorBaseConfigured bool
+	if value, ok := configValue(config, "mirror_base_url", "javdb_mirror_base_url"); ok && value != "" {
+		var err error
+		mirrorBase, err = normalizeMirrorBaseURL(value)
+		if err != nil {
+			return err
+		}
+		mirrorBaseConfigured = true
+	}
+	var mirrorMode string
+	var mirrorModeConfigured bool
+	if value, ok := configValue(config, "mirror_mode", "javdb_mirror_mode", "source_mode"); ok && value != "" {
+		var err error
+		mirrorMode, err = parseMirrorMode(value)
+		if err != nil {
+			return fmt.Errorf("invalid JavDBActor mirror mode")
+		}
+		mirrorModeConfigured = true
+	}
+	var mirrorTimeout time.Duration
+	if value, ok := configValue(config, "mirror_timeout", "javdb_mirror_timeout"); ok && value != "" {
+		var err error
+		mirrorTimeout, err = time.ParseDuration(value)
+		if err != nil || mirrorTimeout <= 0 {
+			return fmt.Errorf("invalid JavDBActor mirror timeout")
+		}
+	}
+	mirrorUsername, mirrorPassword, mirrorCredentialsSet, err := parseMirrorCredentials(config)
+	if err != nil {
+		return err
+	}
+	if mirrorEnabled != nil || mirrorBaseConfigured || mirrorModeConfigured || mirrorTimeout > 0 || mirrorCredentialsSet {
+		jdb.mirrorMu.Lock()
+		if mirrorEnabled != nil {
+			jdb.mirrorEnabled = *mirrorEnabled
+		}
+		if mirrorBaseConfigured {
+			jdb.mirrorBaseURL = mirrorBase
+			jdb.mirrorConfigured = true
+		}
+		if mirrorModeConfigured {
+			jdb.mirrorMode = mirrorMode
+		}
+		if mirrorTimeout > 0 {
+			jdb.mirrorTimeout = mirrorTimeout
+		}
+		if mirrorCredentialsSet {
+			jdb.mirrorUsername = mirrorUsername
+			jdb.mirrorPassword = mirrorPassword
+		}
+		jdb.mirror = nil
+		jdb.mirrorMu.Unlock()
 	}
 	if value, ok := configValue(config, "base_url", "javdb_base_url"); ok && value != "" {
 		base, err := normalizeJavDBBaseURL(value)
@@ -300,11 +432,33 @@ func (jdb *JavDBActor) GetActorInfoByID(id string) (*model.ActorInfo, error) {
 }
 
 func (jdb *JavDBActor) GetActorInfoByURL(rawURL string) (info *model.ActorInfo, err error) {
-	if err = jdb.ensureCookieCloudCookies(); err != nil {
-		return nil, err
-	}
 	id, err := jdb.ParseActorIDFromURL(rawURL)
 	if err != nil {
+		return nil, err
+	}
+	if jdb.shouldUseMirror(rawURL) {
+		mirror, mirrorErr := jdb.getMirrorClient()
+		if mirrorErr == nil && mirror != nil {
+			info, mirrorErr = mirror.GetActorInfoByID(id)
+			if mirrorErr == nil && info != nil && info.ID == id && info.IsValid() {
+				return info, nil
+			}
+			if mirrorErr == nil {
+				if info != nil && info.ID != id {
+					mirrorErr = ErrMirrorActorMismatch
+				} else {
+					mirrorErr = ErrMirrorInvalidResponse
+				}
+			}
+		}
+		if jdb.isMirrorOnly(rawURL) {
+			if mirrorErr != nil {
+				return nil, fmt.Errorf("JavDB mirror actor lookup failed: %w", mirrorErr)
+			}
+			return nil, ErrMirrorActorNoResult
+		}
+	}
+	if err = jdb.ensureCookieCloudCookies(); err != nil {
 		return nil, err
 	}
 
@@ -433,6 +587,22 @@ func (jdb *JavDBActor) GetActorInfoByURL(rawURL string) (info *model.ActorInfo, 
 }
 
 func (jdb *JavDBActor) SearchActor(keyword string) (results []*model.ActorSearchResult, err error) {
+	if jdb.shouldUseMirror(jdb.searchEndpoint) {
+		mirror, mirrorErr := jdb.getMirrorClient()
+		if mirrorErr == nil && mirror != nil {
+			results, lookupErr := mirror.SearchActor(keyword)
+			if lookupErr == nil {
+				return results, nil
+			}
+			mirrorErr = lookupErr
+		}
+		if jdb.isMirrorOnly(jdb.searchEndpoint) {
+			if mirrorErr != nil {
+				return nil, fmt.Errorf("JavDB mirror actor search failed: %w", mirrorErr)
+			}
+			return nil, nil
+		}
+	}
 	if err = jdb.ensureCookieCloudCookies(); err != nil {
 		return nil, err
 	}

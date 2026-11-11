@@ -79,6 +79,7 @@ func newJavDBRecoveryClient(
 	config := envconfig.NewConfig()
 	config.Set("mirror_base_url", mirrorURL+"/api")
 	config.Set("mirror_timeout", "1s")
+	config.Set("mirror_mode", mirrorModeFallback)
 	config.Set("cookiecloud_host", cookieCloudServer.URL)
 	config.Set("cookiecloud_uuid", "test-uuid")
 	config.Set("cookiecloud_password", "test-password")

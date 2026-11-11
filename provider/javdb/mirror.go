@@ -38,8 +38,13 @@ var (
 	ErrMirrorBusiness        = errors.New("javdb mirror: business error")
 	ErrMirrorInvalidResponse = errors.New("javdb mirror: invalid response")
 	ErrMirrorMismatch        = errors.New("javdb mirror: movie identity mismatch")
+	ErrMirrorActorMismatch   = errors.New("javdb mirror: actor identity mismatch")
 	ErrMirrorAmbiguous       = errors.New("javdb mirror: ambiguous movie identity")
+	ErrMirrorNoResult        = errors.New("javdb mirror: no exact movie found")
+	ErrMirrorActorNoResult   = errors.New("javdb mirror: actor not found")
+	ErrMirrorOriginDisabled  = errors.New("javdb: origin fallback disabled by mirror-only mode")
 	ErrMirrorRedirect        = errors.New("javdb mirror: redirect rejected")
+	ErrMirrorAuth            = errors.New("javdb mirror: authentication required")
 
 	mirrorIDPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 	fc2MirrorNumberRE = regexp.MustCompile(`(?i)^FC2(?:-?PPV)?-?(\d+)(?:-(?:C|U|UC))?$`)
@@ -71,8 +76,10 @@ func (e *mirrorClientError) Unwrap() error { return e.kind }
 type mirrorCacheEntry struct {
 	expires time.Time
 	info    *model.MovieInfo
+	actor   *model.ActorInfo
 	typeID  int
 	results []*model.MovieSearchResult
+	actors  []*model.ActorSearchResult
 }
 
 type mirrorCall struct {
@@ -84,21 +91,29 @@ type mirrorCall struct {
 type mirrorClient struct {
 	baseURL    string
 	httpClient *http.Client
+	username   string
+	password   string
 
 	mu            sync.Mutex
 	cache         map[string]mirrorCacheEntry
 	inFlight      map[string]*mirrorCall
 	cooldownUntil time.Time
+	session       mirrorSession
+	loginCall     *mirrorLoginCall
 }
 
 type mirrorEnvelope struct {
 	Success json.RawMessage `json:"success"`
 	Data    json.RawMessage `json:"data"`
+	Action  json.RawMessage `json:"action"`
 }
 
 type mirrorDataEnvelope struct {
 	Movie  json.RawMessage `json:"movie"`
 	Movies json.RawMessage `json:"movies"`
+	Actor  json.RawMessage `json:"actor"`
+	Actors json.RawMessage `json:"actors"`
+	Tags   []mirrorTag     `json:"tags"`
 }
 
 type mirrorSearchMovie struct {
@@ -112,6 +127,28 @@ type mirrorActor struct {
 	Name      string `json:"name"`
 	Gender    *int   `json:"gender"`
 	AvatarURL string `json:"avatar_url"`
+}
+
+type mirrorActorDetail struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Gender    *int            `json:"gender"`
+	AvatarURL string          `json:"avatar_url"`
+	Summary   string          `json:"summary"`
+	NameZHT   json.RawMessage `json:"name_zht"`
+	OtherName json.RawMessage `json:"other_name"`
+	Aliases   json.RawMessage `json:"aliases"`
+	Tags      []mirrorTag     `json:"tags"`
+}
+
+type mirrorSearchActor struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Gender    *int            `json:"gender"`
+	NameZHT   json.RawMessage `json:"name_zht"`
+	OtherName json.RawMessage `json:"other_name"`
+	AvatarURL string          `json:"avatar_url"`
+	Aliases   json.RawMessage `json:"aliases"`
 }
 
 type mirrorTag struct {
@@ -192,6 +229,30 @@ func mirrorSignature(now time.Time) string {
 }
 
 func (c *mirrorClient) requestJSON(path string, query url.Values, dst any) error {
+	if c.username == "" {
+		return c.requestWire(http.MethodGet, path, query, nil, "", "", dst)
+	}
+	session, err := c.ensureSession()
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		err = c.requestWire(http.MethodGet, path, query, nil, "", session.token, dst)
+		if !errors.Is(err, ErrMirrorAuth) {
+			return err
+		}
+		c.invalidateSession(session)
+		if attempt == 0 {
+			session, err = c.ensureSession()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return err
+}
+
+func (c *mirrorClient) requestWire(method, path string, query url.Values, body io.Reader, contentType, token string, dst any) error {
 	c.mu.Lock()
 	if time.Now().Before(c.cooldownUntil) {
 		c.mu.Unlock()
@@ -206,11 +267,17 @@ func (c *mirrorClient) requestJSON(path string, query url.Values, dst any) error
 	if query != nil {
 		endpoint.RawQuery = query.Encode()
 	}
-	req, err := http.NewRequest(http.MethodGet, endpoint.String(), nil)
+	req, err := http.NewRequest(method, endpoint.String(), body)
 	if err != nil {
 		return &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "invalid request"}
 	}
 	req.Header.Set("Accept", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", token)
+	}
 	req.Header.Set("jdsignature", mirrorSignature(time.Now()))
 	req.Header.Set("Origin", "https://catembylegacy.fastcdn.dpdns.org")
 	req.Header.Set("Referer", "https://catembylegacy.fastcdn.dpdns.org/")
@@ -237,25 +304,37 @@ func (c *mirrorClient) requestJSON(path string, query url.Values, dst any) error
 		c.mu.Unlock()
 		return &mirrorClientError{kind: ErrMirrorRateLimited, status: response.StatusCode}
 	}
+	if response.StatusCode == http.StatusUnauthorized {
+		return &mirrorClientError{kind: ErrMirrorAuth, status: response.StatusCode}
+	}
 	if response.StatusCode != http.StatusOK {
 		return &mirrorClientError{kind: ErrMirrorInvalidResponse, status: response.StatusCode}
 	}
 	if response.ContentLength > mirrorMaxResponse {
 		return &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "response exceeds 5 MiB"}
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, mirrorMaxResponse+1))
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, mirrorMaxResponse+1))
 	if err != nil {
 		return &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "could not read response"}
 	}
-	if len(body) > mirrorMaxResponse {
+	if len(responseBody) > mirrorMaxResponse {
 		return &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "response exceeds 5 MiB"}
 	}
 	var envelope mirrorEnvelope
-	if err := json.Unmarshal(body, &envelope); err != nil {
+	if err := json.Unmarshal(responseBody, &envelope); err != nil {
 		return &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "invalid JSON"}
 	}
 	var success int
 	if len(envelope.Success) == 0 || json.Unmarshal(envelope.Success, &success) != nil || success != 1 {
+		// Boolean success values are malformed, even when accompanied by an action.
+		if string(bytes.TrimSpace(envelope.Success)) != "true" && string(bytes.TrimSpace(envelope.Success)) != "false" {
+			action := strings.ToLower(mirrorRawString(envelope.Action))
+			for _, marker := range []string{"login", "auth", "session", "token"} {
+				if strings.Contains(action, marker) {
+					return &mirrorClientError{kind: ErrMirrorAuth}
+				}
+			}
+		}
 		return &mirrorClientError{kind: ErrMirrorBusiness, detail: "success must be integer 1"}
 	}
 	if len(envelope.Data) == 0 || string(bytes.TrimSpace(envelope.Data)) == "null" {
@@ -273,6 +352,35 @@ func (c *mirrorClient) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 		return nil, err
 	}
 	return entry.info, nil
+}
+
+func (c *mirrorClient) GetActorInfoByID(id string) (*model.ActorInfo, error) {
+	id = strings.TrimSpace(id)
+	if !mirrorIDPattern.MatchString(id) || strings.Contains(id, "..") {
+		return nil, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "invalid actor ID"}
+	}
+	entry, err := c.cached("actor:"+id, func() (mirrorCacheEntry, error) {
+		var data mirrorDataEnvelope
+		if err := c.requestJSON("/v1/actors/"+url.PathEscape(id), nil, &data); err != nil {
+			return mirrorCacheEntry{}, err
+		}
+		if len(data.Actor) == 0 || string(bytes.TrimSpace(data.Actor)) == "null" {
+			return mirrorCacheEntry{}, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "missing actor"}
+		}
+		var raw mirrorActorDetail
+		if err := json.Unmarshal(data.Actor, &raw); err != nil {
+			return mirrorCacheEntry{}, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "invalid actor"}
+		}
+		info, err := mirrorActorInfo(raw, id)
+		if err != nil {
+			return mirrorCacheEntry{}, err
+		}
+		return mirrorCacheEntry{actor: info}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entry.actor, nil
 }
 
 func (c *mirrorClient) getMovieInfoByID(id string) (mirrorCacheEntry, error) {
@@ -373,6 +481,68 @@ func (c *mirrorClient) SearchMovie(keyword string) ([]*model.MovieSearchResult, 
 	return value.results, nil
 }
 
+func (c *mirrorClient) SearchActor(keyword string) ([]*model.ActorSearchResult, error) {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return []*model.ActorSearchResult{}, nil
+	}
+	entry, err := c.cached("actor-search:"+keyword, func() (mirrorCacheEntry, error) {
+		query := make(url.Values)
+		query.Set("q", keyword)
+		query.Set("page", "1")
+		query.Set("type", "actor")
+		query.Set("limit", "24")
+		var data mirrorDataEnvelope
+		if err := c.requestJSON("/v2/search", query, &data); err != nil {
+			return mirrorCacheEntry{}, err
+		}
+		if len(data.Actors) == 0 || string(bytes.TrimSpace(data.Actors)) == "null" {
+			return mirrorCacheEntry{}, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "missing actors list"}
+		}
+		var actors []mirrorSearchActor
+		if err := json.Unmarshal(data.Actors, &actors); err != nil {
+			return mirrorCacheEntry{}, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "invalid actors list"}
+		}
+		results := make([]*model.ActorSearchResult, 0, len(actors))
+		seenIDs := make(map[string]struct{}, len(actors))
+		for _, actor := range actors {
+			id := strings.TrimSpace(actor.ID)
+			if !mirrorIDPattern.MatchString(id) || strings.Contains(id, "..") ||
+				(actor.Gender != nil && *actor.Gender != 0) {
+				continue
+			}
+			if _, duplicate := seenIDs[id]; duplicate {
+				continue
+			}
+			name := strings.TrimSpace(actor.Name)
+			if name == "" {
+				name = mirrorRawString(actor.NameZHT)
+			}
+			result := &model.ActorSearchResult{
+				ID:       id,
+				Name:     name,
+				Provider: ActorProviderName,
+				Homepage: "https://javdb.com/actors/" + id,
+				Aliases:  mirrorActorAliases(name, actor.Aliases, actor.NameZHT, actor.OtherName),
+				Images:   make(pq.StringArray, 0, 1),
+			}
+			if avatar := mirrorHTTPURL(actor.AvatarURL); avatar != "" {
+				result.Images = append(result.Images, avatar)
+			}
+			if !result.IsValid() {
+				continue
+			}
+			seenIDs[id] = struct{}{}
+			results = append(results, result)
+		}
+		return mirrorCacheEntry{actors: results}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entry.actors, nil
+}
+
 func (c *mirrorClient) cached(key string, load func() (mirrorCacheEntry, error)) (mirrorCacheEntry, error) {
 	c.mu.Lock()
 	now := time.Now()
@@ -396,7 +566,7 @@ func (c *mirrorClient) cached(key string, load func() (mirrorCacheEntry, error))
 	c.mu.Lock()
 	call.entry = cloneMirrorEntry(entry)
 	call.err = err
-	if err == nil && (entry.info != nil || len(entry.results) > 0) {
+	if err == nil && (entry.info != nil || entry.actor != nil || len(entry.results) > 0 || len(entry.actors) > 0) {
 		if len(c.cache) >= mirrorCacheLimit {
 			var oldestKey string
 			var oldestExpiry time.Time
@@ -425,6 +595,12 @@ func cloneMirrorEntry(entry mirrorCacheEntry) mirrorCacheEntry {
 		info.Genres = append(pq.StringArray(nil), entry.info.Genres...)
 		cloned.info = &info
 	}
+	if entry.actor != nil {
+		actor := *entry.actor
+		actor.Aliases = append(pq.StringArray(nil), entry.actor.Aliases...)
+		actor.Images = append(pq.StringArray(nil), entry.actor.Images...)
+		cloned.actor = &actor
+	}
 	if entry.results != nil {
 		cloned.results = make([]*model.MovieSearchResult, 0, len(entry.results))
 		for _, result := range entry.results {
@@ -435,6 +611,19 @@ func cloneMirrorEntry(entry mirrorCacheEntry) mirrorCacheEntry {
 			copyResult := *result
 			copyResult.Actors = append(pq.StringArray(nil), result.Actors...)
 			cloned.results = append(cloned.results, &copyResult)
+		}
+	}
+	if entry.actors != nil {
+		cloned.actors = make([]*model.ActorSearchResult, 0, len(entry.actors))
+		for _, result := range entry.actors {
+			if result == nil {
+				cloned.actors = append(cloned.actors, nil)
+				continue
+			}
+			copyResult := *result
+			copyResult.Aliases = append(pq.StringArray(nil), result.Aliases...)
+			copyResult.Images = append(pq.StringArray(nil), result.Images...)
+			cloned.actors = append(cloned.actors, &copyResult)
 		}
 	}
 	return cloned
@@ -497,6 +686,74 @@ func mirrorMovieInfo(movie mirrorMovie, requestedID string) (*model.MovieInfo, e
 		return nil, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "movie is missing required fields"}
 	}
 	return info, nil
+}
+
+func mirrorActorInfo(actor mirrorActorDetail, requestedID string) (*model.ActorInfo, error) {
+	if actor.ID != requestedID {
+		return nil, &mirrorClientError{kind: ErrMirrorActorMismatch, detail: "detail ID does not match request"}
+	}
+	name := strings.TrimSpace(actor.Name)
+	if name == "" {
+		name = mirrorRawString(actor.NameZHT)
+	}
+	info := &model.ActorInfo{
+		ID:       actor.ID,
+		Name:     name,
+		Provider: ActorProviderName,
+		Homepage: "https://javdb.com/actors/" + actor.ID,
+		Summary:  strings.TrimSpace(actor.Summary),
+		Aliases:  mirrorActorAliases(name, actor.Aliases, actor.NameZHT, actor.OtherName),
+		Images:   make(pq.StringArray, 0, 1),
+	}
+	if avatarURL := mirrorHTTPURL(actor.AvatarURL); avatarURL != "" {
+		info.Images = append(info.Images, avatarURL)
+	}
+	if !info.IsValid() {
+		return nil, &mirrorClientError{kind: ErrMirrorInvalidResponse, detail: "actor is missing required fields"}
+	}
+	return info, nil
+}
+
+func mirrorActorAliases(primary string, rawValues ...json.RawMessage) pq.StringArray {
+	aliases := make(pq.StringArray, 0, len(rawValues))
+	for _, raw := range rawValues {
+		if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+			continue
+		}
+		var values []string
+		if json.Unmarshal(raw, &values) != nil {
+			var value string
+			if json.Unmarshal(raw, &value) != nil {
+				continue
+			}
+			values = splitActorAliases(value)
+		}
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value != "" && normalizeActorText(value) != normalizeActorText(primary) {
+				aliases = appendActorAlias(aliases, value)
+			}
+		}
+	}
+	return aliases
+}
+
+func mirrorRawString(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func mirrorHTTPURL(raw string) string {
+	value := strings.TrimSpace(raw)
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.Host != "" && parsed.User == nil &&
+		(parsed.Scheme == "http" || parsed.Scheme == "https") {
+		return value
+	}
+	return ""
 }
 
 func parseMirrorType(raw json.RawMessage) (int, bool) {

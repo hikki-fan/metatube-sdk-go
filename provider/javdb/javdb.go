@@ -68,6 +68,12 @@ const (
 	defaultMirrorEnabled = true
 	defaultMirrorBaseURL = "https://jdforrepam.com/api"
 	defaultMirrorTimeout = 8 * time.Second
+	defaultMirrorMode    = mirrorModeOnly
+)
+
+const (
+	mirrorModeOnly     = "mirror-only"
+	mirrorModeFallback = "mirror-fallback"
 )
 
 // ErrLoginRequired is returned when JavDB redirects a request to a login page
@@ -77,6 +83,11 @@ var ErrLoginRequired = errors.New("javdb: login required")
 type javDBMirror interface {
 	SearchMovie(keyword string) ([]*model.MovieSearchResult, error)
 	GetMovieInfoByID(id string) (*model.MovieInfo, error)
+}
+
+type javDBActorMirror interface {
+	SearchActor(keyword string) ([]*model.ActorSearchResult, error)
+	GetActorInfoByID(id string) (*model.ActorInfo, error)
 }
 
 func isJavDBOriginURL(raw string) bool {
@@ -107,6 +118,17 @@ func parseMirrorBool(value string) (bool, error) {
 		return false, nil
 	default:
 		return strconv.ParseBool(strings.TrimSpace(value))
+	}
+}
+
+func parseMirrorMode(value string) (string, error) {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "_", "-")) {
+	case mirrorModeOnly, "only":
+		return mirrorModeOnly, nil
+	case mirrorModeFallback, "fallback":
+		return mirrorModeFallback, nil
+	default:
+		return "", fmt.Errorf("invalid JavDB mirror mode")
 	}
 }
 
@@ -186,6 +208,9 @@ type JavDB struct {
 	mirrorBaseURL    string
 	mirrorProxy      string
 	mirrorTimeout    time.Duration
+	mirrorMode       string
+	mirrorUsername   string
+	mirrorPassword   string
 	mirrorConfigured bool
 	mirror           javDBMirror
 
@@ -229,6 +254,7 @@ func New() *JavDB {
 		mirrorEnabled:      defaultMirrorEnabled,
 		mirrorBaseURL:      defaultMirrorBaseURL,
 		mirrorTimeout:      defaultMirrorTimeout,
+		mirrorMode:         defaultMirrorMode,
 		imageFallbackCache: make(map[string]javDBImageFallbackCacheEntry),
 		imageFallbackCalls: make(map[string]*javDBImageFallbackCall),
 		browserTransport:   browserTransport,
@@ -269,6 +295,15 @@ func (jdb *JavDB) shouldUseMirror(targetOriginURL string) bool {
 	return isJavDBOriginURL(targetOriginURL)
 }
 
+func (jdb *JavDB) isMirrorOnly(targetOriginURL string) bool {
+	jdb.mirrorMu.Lock()
+	enabled := jdb.mirrorEnabled
+	configured := jdb.mirrorConfigured || jdb.mirror != nil
+	mode := jdb.mirrorMode
+	jdb.mirrorMu.Unlock()
+	return enabled && mode == mirrorModeOnly && (configured || isJavDBOriginURL(targetOriginURL))
+}
+
 func (jdb *JavDB) getMirrorClient() (javDBMirror, error) {
 	jdb.mirrorMu.Lock()
 	defer jdb.mirrorMu.Unlock()
@@ -286,7 +321,7 @@ func (jdb *JavDB) getMirrorClient() (javDBMirror, error) {
 	if timeout <= 0 {
 		timeout = defaultMirrorTimeout
 	}
-	client, err := newMirrorClient(base, jdb.mirrorProxy, timeout)
+	client, err := newMirrorClientWithCredentials(base, jdb.mirrorProxy, timeout, jdb.mirrorUsername, jdb.mirrorPassword)
 	if err != nil {
 		return nil, err
 	}
@@ -377,6 +412,9 @@ func (jdb *JavDB) SetCookies(rawURL string, cookies []*http.Cookie) error {
 //	MT_MOVIE_PROVIDER_JAVDB__MIRROR_ENABLED (optional, defaults to true)
 //	MT_MOVIE_PROVIDER_JAVDB__MIRROR_BASE_URL (optional, defaults to https://jdforrepam.com/api)
 //	MT_MOVIE_PROVIDER_JAVDB__MIRROR_TIMEOUT (optional, defaults to 8s)
+//	MT_MOVIE_PROVIDER_JAVDB__MIRROR_MODE (optional, defaults to mirror-only; mirror-fallback enables origin scraping)
+//	MT_MOVIE_PROVIDER_JAVDB__MIRROR_USERNAME (optional; requires MIRROR_PASSWORD)
+//	MT_MOVIE_PROVIDER_JAVDB__MIRROR_PASSWORD (optional; requires MIRROR_USERNAME)
 //	MT_MOVIE_PROVIDER_JAVDB__WESTERN_SEARCH_INTERVAL (optional, a duration or
 //		a range such as 10s-20s; default 10s-20s)
 //
@@ -404,6 +442,16 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 		}
 		mirrorBaseConfigured = true
 	}
+	var mirrorMode string
+	var mirrorModeConfigured bool
+	if value, ok := configValue(config, "mirror_mode", "javdb_mirror_mode", "source_mode"); ok && value != "" {
+		var err error
+		mirrorMode, err = parseMirrorMode(value)
+		if err != nil {
+			return err
+		}
+		mirrorModeConfigured = true
+	}
 	var mirrorTimeout time.Duration
 	if value, ok := configValue(config, "mirror_timeout", "javdb_mirror_timeout"); ok && value != "" {
 		var err error
@@ -412,7 +460,11 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 			return fmt.Errorf("invalid JavDB mirror timeout")
 		}
 	}
-	if mirrorEnabled != nil || mirrorBaseConfigured || mirrorTimeout > 0 {
+	mirrorUsername, mirrorPassword, mirrorCredentialsSet, err := parseMirrorCredentials(config)
+	if err != nil {
+		return err
+	}
+	if mirrorEnabled != nil || mirrorBaseConfigured || mirrorModeConfigured || mirrorTimeout > 0 || mirrorCredentialsSet {
 		jdb.mirrorMu.Lock()
 		if mirrorEnabled != nil {
 			jdb.mirrorEnabled = *mirrorEnabled
@@ -421,8 +473,15 @@ func (jdb *JavDB) SetConfig(config provider.Config) error {
 			jdb.mirrorBaseURL = mirrorBase
 			jdb.mirrorConfigured = true
 		}
+		if mirrorModeConfigured {
+			jdb.mirrorMode = mirrorMode
+		}
 		if mirrorTimeout > 0 {
 			jdb.mirrorTimeout = mirrorTimeout
+		}
+		if mirrorCredentialsSet {
+			jdb.mirrorUsername = mirrorUsername
+			jdb.mirrorPassword = mirrorPassword
 		}
 		jdb.mirror = nil
 		jdb.mirrorMu.Unlock()
@@ -919,12 +978,27 @@ func (jdb *JavDB) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
 		return nil, err
 	}
 	if jdb.shouldUseMirror(rawURL) {
-		if mirror, mirrorErr := jdb.getMirrorClient(); mirrorErr == nil && mirror != nil {
-			info, mirrorErr := mirror.GetMovieInfoByID(id)
-			if mirrorErr == nil && info != nil && info.ID == id && info.IsValid() {
+		mirror, mirrorErr := jdb.getMirrorClient()
+		if mirrorErr == nil && mirror != nil {
+			info, lookupErr := mirror.GetMovieInfoByID(id)
+			if lookupErr == nil && info != nil && info.ID == id && info.IsValid() {
 				log.Printf("JavDB mirror detail lookup hit")
 				return info, nil
 			}
+			if lookupErr == nil {
+				if info != nil && info.ID != id {
+					lookupErr = ErrMirrorMismatch
+				} else {
+					lookupErr = ErrMirrorInvalidResponse
+				}
+			}
+			mirrorErr = lookupErr
+		}
+		if jdb.isMirrorOnly(rawURL) {
+			if mirrorErr != nil {
+				return nil, fmt.Errorf("JavDB mirror detail lookup failed: %w", mirrorErr)
+			}
+			return nil, ErrMirrorNoResult
 		}
 		log.Printf("JavDB mirror detail lookup missed; using origin")
 	}
@@ -1021,12 +1095,20 @@ func (jdb *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, int, 
 
 func (jdb *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error) {
 	if jdb.shouldUseMirror(jdb.searchURL) {
-		if mirror, mirrorErr := jdb.getMirrorClient(); mirrorErr == nil && mirror != nil {
-			results, mirrorErr := mirror.SearchMovie(keyword)
-			if mirrorErr == nil && len(results) > 0 {
+		mirror, mirrorErr := jdb.getMirrorClient()
+		if mirrorErr == nil && mirror != nil {
+			results, lookupErr := mirror.SearchMovie(keyword)
+			if lookupErr == nil {
 				log.Printf("JavDB mirror search hit")
 				return results, nil
 			}
+			mirrorErr = lookupErr
+		}
+		if jdb.isMirrorOnly(jdb.searchURL) {
+			if mirrorErr != nil {
+				return nil, fmt.Errorf("JavDB mirror search failed: %w", mirrorErr)
+			}
+			return nil, nil
 		}
 		log.Printf("JavDB mirror search missed; using origin")
 	}

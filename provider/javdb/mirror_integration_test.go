@@ -55,6 +55,7 @@ func TestJavDBMirrorDefaultsAndCustomOriginOptIn(t *testing.T) {
 	assert.True(t, jdb.mirrorEnabled)
 	assert.Equal(t, defaultMirrorBaseURL, jdb.mirrorBaseURL)
 	assert.Equal(t, 8*time.Second, jdb.mirrorTimeout)
+	assert.Equal(t, mirrorModeOnly, jdb.mirrorMode)
 	assert.False(t, jdb.shouldUseMirror("http://127.0.0.1:12345/v/Fixture"))
 	assert.True(t, jdb.shouldUseMirror("https://javdb.com/v/Fixture"))
 	assert.True(t, jdb.shouldUseMirror(jdb.searchURL))
@@ -71,6 +72,44 @@ func TestJavDBMirrorDefaultsAndCustomOriginOptIn(t *testing.T) {
 	disabled.Set("mirror_enabled", "false")
 	require.NoError(t, jdb.SetConfig(disabled))
 	assert.False(t, jdb.shouldUseMirror("https://javdb.com/v/Fixture"))
+}
+
+func TestJavDBMirrorOnlyDoesNotFallBackToOrigin(t *testing.T) {
+	var mirrorRequests atomic.Int32
+	mirrorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirrorRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v2/search" {
+			_, _ = w.Write([]byte(`{"success":1,"data":{"movies":[]}}`))
+			return
+		}
+		http.Error(w, "mirror unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(mirrorServer.Close)
+
+	var originRequests atomic.Int32
+	originServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		http.Error(w, "origin must not be called", http.StatusInternalServerError)
+	}))
+	t.Cleanup(originServer.Close)
+
+	config := envconfig.NewConfig()
+	config.Set("mirror_base_url", mirrorServer.URL+"/api")
+	config.Set("mirror_timeout", "1s")
+	jdb := New()
+	require.NoError(t, jdb.SetConfig(config))
+	jdb.searchURL = originServer.URL + "/search?f=all&q=%s"
+	jdb.movieURL = originServer.URL + "/v/%s"
+
+	results, err := jdb.SearchMovie("ABP-123")
+	require.NoError(t, err)
+	assert.Empty(t, results, "an empty mirror search is a successful no-result response")
+	_, err = jdb.GetMovieInfoByURL(originServer.URL + "/v/MissingID")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrMirrorInvalidResponse)
+	assert.Equal(t, int32(2), mirrorRequests.Load())
+	assert.Zero(t, originRequests.Load())
 }
 
 func TestJavDBMirrorHitSkipsOriginAndCookieCloud(t *testing.T) {

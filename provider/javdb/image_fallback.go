@@ -35,6 +35,14 @@ func (jdb *JavDB) GetMovieImageFallbackURLsByID(id string) ([]string, error) {
 	if normalizedID == "" || normalizedID != id || strings.ContainsAny(id, "/\\?#%\x00\r\n\t ") || id == "." || id == ".." {
 		return nil, provider.ErrInvalidID
 	}
+	endpoint := jdb.movieURL
+	if endpoint == "" {
+		endpoint = movieURL
+	}
+	rawURL := fmt.Sprintf(endpoint, url.PathEscape(id))
+	if jdb.isMirrorOnly(rawURL) {
+		return nil, ErrMirrorOriginDisabled
+	}
 
 	jdb.imageFallbackMu.Lock()
 	now := time.Now()
