@@ -329,6 +329,9 @@ func (c *mirrorClient) requestWire(method, path string, query url.Values, body i
 		// Boolean success values are malformed, even when accompanied by an action.
 		if string(bytes.TrimSpace(envelope.Success)) != "true" && string(bytes.TrimSpace(envelope.Success)) != "false" {
 			action := strings.ToLower(mirrorRawString(envelope.Action))
+			if action == "jwtverificationerror" {
+				return &mirrorClientError{kind: ErrMirrorAuth}
+			}
 			for _, marker := range []string{"login", "auth", "session", "token"} {
 				if strings.Contains(action, marker) {
 					return &mirrorClientError{kind: ErrMirrorAuth}

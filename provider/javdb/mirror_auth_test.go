@@ -29,6 +29,12 @@ func mirrorAuthTestLogin(w http.ResponseWriter) {
 	mirrorTestWriteJSON(w, map[string]any{"success": 1, "data": map[string]any{"token": "fixture-session-token"}})
 }
 
+func mirrorAuthTestJWTExpired(w http.ResponseWriter) {
+	mirrorTestWriteJSON(w, map[string]any{
+		"success": 0, "action": "JWTVerificationError", "message": "login required", "data": map[string]any{},
+	})
+}
+
 func TestMirrorAuthLoginMultipartAndIsolatedToken(t *testing.T) {
 	var logins, lookups atomic.Int32
 	client := newMirrorAuthTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +85,8 @@ func TestMirrorAuthRefreshOnlyOnExplicitSessionFailure(t *testing.T) {
 		{"unauthorized", 401, nil, nil, 2},
 		{"session-expired", 200, map[string]any{"success": 0, "action": "session_expired"}, nil, 2},
 		{"login-required", 200, map[string]any{"success": 0, "action": "login"}, nil, 2},
+		{"jwt-verification-error-case-insensitive", 200, map[string]any{"success": 0, "action": "jwtverificationerror"}, nil, 2},
+		{"jwt-verification-error-substring-is-business", 200, map[string]any{"success": 0, "action": "JWTVerificationErrorExpired"}, ErrMirrorBusiness, 1},
 		{"generic-business-error", 200, map[string]any{"success": 0, "message": "fixture-password"}, ErrMirrorBusiness, 1},
 		{"boolean-success", 200, map[string]any{"success": false, "action": "login"}, ErrMirrorBusiness, 1},
 		{"forbidden", 403, nil, ErrMirrorRateLimited, 1},
@@ -122,22 +130,106 @@ func TestMirrorAuthRefreshOnlyOnExplicitSessionFailure(t *testing.T) {
 	}
 }
 
-func TestMirrorAuthPersistentUnauthorizedRefreshesAtMostOnce(t *testing.T) {
-	var logins, lookups atomic.Int32
-	client := newMirrorAuthTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/sessions" {
-			logins.Add(1)
-			mirrorAuthTestLogin(w)
-			return
-		}
-		lookups.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	})
-	var data any
-	require.ErrorIs(t, client.requestJSON("/v2/search", nil, &data), ErrMirrorAuth)
-	assert.EqualValues(t, 2, logins.Load())
-	assert.EqualValues(t, 2, lookups.Load())
-	assert.Empty(t, client.session.token)
+func TestMirrorAuthPersistentSessionFailureRefreshesAtMostOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		jwtFail bool
+	}{
+		{name: "unauthorized", status: http.StatusUnauthorized},
+		{name: "jwt-verification-error", status: http.StatusOK, jwtFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logins, lookups atomic.Int32
+			client := newMirrorAuthTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/sessions" {
+					logins.Add(1)
+					mirrorAuthTestLogin(w)
+					return
+				}
+				lookups.Add(1)
+				if tc.jwtFail {
+					mirrorAuthTestJWTExpired(w)
+					return
+				}
+				w.WriteHeader(tc.status)
+			})
+			var data any
+			require.ErrorIs(t, client.requestJSON("/v2/search", nil, &data), ErrMirrorAuth)
+			assert.EqualValues(t, 2, logins.Load())
+			assert.EqualValues(t, 2, lookups.Load())
+			assert.Empty(t, client.session.token)
+		})
+	}
+}
+
+func TestMirrorAuthJWTVerificationErrorRefreshesSearchAndDetail(t *testing.T) {
+	const movieID = "2mO9qq"
+	for _, tc := range []struct {
+		name       string
+		expiredURL string
+		search     bool
+	}{
+		{name: "search", expiredURL: "/api/v2/search", search: true},
+		{name: "detail", expiredURL: "/api/v4/movies/" + movieID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logins, searchRequests, detailRequests, expiredResponses atomic.Int32
+			client := newMirrorAuthTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/sessions":
+					loginNumber := logins.Add(1)
+					mirrorTestWriteJSON(w, map[string]any{"success": 1, "data": map[string]any{
+						"token": fmt.Sprintf("fixture-session-token-%d", loginNumber),
+					}})
+				case "/api/v2/search":
+					searchRequests.Add(1)
+					assert.Equal(t, "MIUM-1434", r.URL.Query().Get("q"))
+					if r.URL.Path == tc.expiredURL && expiredResponses.CompareAndSwap(0, 1) {
+						assert.Equal(t, "fixture-session-token-1", r.Header.Get("Authorization"))
+						mirrorAuthTestJWTExpired(w)
+						return
+					}
+					assert.Equal(t, "fixture-session-token-2", r.Header.Get("Authorization"))
+					mirrorTestWriteJSON(w, map[string]any{"success": 1, "data": map[string]any{
+						"movies": []map[string]any{mirrorTestMovie(movieID, "MIUM-1434", 0)},
+					}})
+				case "/api/v4/movies/" + movieID:
+					detailRequests.Add(1)
+					if r.URL.Path == tc.expiredURL && expiredResponses.CompareAndSwap(0, 1) {
+						assert.Equal(t, "fixture-session-token-1", r.Header.Get("Authorization"))
+						mirrorAuthTestJWTExpired(w)
+						return
+					}
+					assert.Equal(t, "fixture-session-token-2", r.Header.Get("Authorization"))
+					mirrorTestWriteJSON(w, map[string]any{"success": 1, "data": map[string]any{
+						"movie": mirrorTestMovie(movieID, "MIUM-1434", 0),
+					}})
+				default:
+					http.NotFound(w, r)
+				}
+			})
+
+			if tc.search {
+				results, err := client.SearchMovie("MIUM-1434")
+				require.NoError(t, err)
+				require.Len(t, results, 1)
+				assert.Equal(t, movieID, results[0].ID)
+				assert.Equal(t, "MIUM-1434", results[0].Number)
+				assert.EqualValues(t, 2, searchRequests.Load())
+				assert.EqualValues(t, 1, detailRequests.Load())
+			} else {
+				info, err := client.GetMovieInfoByID(movieID)
+				require.NoError(t, err)
+				assert.Equal(t, movieID, info.ID)
+				assert.Equal(t, "MIUM-1434", info.Number)
+				assert.EqualValues(t, 0, searchRequests.Load())
+				assert.EqualValues(t, 2, detailRequests.Load())
+			}
+			assert.EqualValues(t, 2, logins.Load())
+			assert.EqualValues(t, 1, expiredResponses.Load())
+		})
+	}
 }
 
 func TestMirrorAuthConcurrentLoginAndRecoveryAreMerged(t *testing.T) {
@@ -157,7 +249,7 @@ func TestMirrorAuthConcurrentLoginAndRecoveryAreMerged(t *testing.T) {
 				close(allOld)
 			}
 			<-allOld
-			w.WriteHeader(http.StatusUnauthorized)
+			mirrorAuthTestJWTExpired(w)
 			return
 		}
 		assert.Equal(t, "fixture-session-token", r.Header.Get("Authorization"))
