@@ -48,6 +48,24 @@ func withJavDBTestJPEGMarker(t *testing.T, plain []byte, marker byte) []byte {
 	return withMarker
 }
 
+func TestDecodeJavDBEncodedPNG(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 3, 2))
+	pixel := color.NRGBA{R: 42, G: 86, B: 123, A: 200}
+	img.SetNRGBA(2, 1, pixel)
+	var plain bytes.Buffer
+	require.NoError(t, png.Encode(&plain, img))
+	for _, key := range []byte{0, 0xb9, 0xff} {
+		encoded := encodeJavDBTestImage(plain.Bytes(), key)
+		got, format, err := DecodeJavDB(bytes.NewReader(encoded))
+		require.NoError(t, err)
+		assert.Equal(t, "png", format)
+		assert.Equal(t, img.Bounds(), got.Bounds())
+		assert.Equal(t, pixel, color.NRGBAModel.Convert(got.At(2, 1)))
+	}
+	_, _, err := DecodeJavDB(bytes.NewReader(encodeJavDBTestImage(plain.Bytes()[:16], 0xb9)))
+	require.Error(t, err)
+}
+
 func TestDecodeJavDBLeavesOtherImageFormatsUnchanged(t *testing.T) {
 	plain := image.NewRGBA(image.Rect(0, 0, 3, 5))
 	plain.Set(1, 2, color.RGBA{R: 255, A: 255})

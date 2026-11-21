@@ -8,14 +8,13 @@ import (
 )
 
 const (
-	javDBJPEGSignatureSize = 3
-	javDBEncodedHeaderSize = javDBJPEGSignatureSize + 1
+	javDBJPEGSignature     = "\xff\xd8\xff"
+	javDBPNGSignature      = "\x89PNG\r\n\x1a\n"
+	javDBEncodedHeaderSize = 1 + len(javDBPNGSignature)
 )
 
-var javDBJPEGSignature = []byte{0xff, 0xd8, 0xff}
-
 // DecodeJavDB decodes JavDB images whose first byte is an XOR key and whose
-// remaining bytes are a JPEG payload XORed with that key. Unencoded images use
+// remaining bytes are a JPEG or PNG payload XORed with that key. Unencoded images use
 // the normal decoder unchanged.
 func DecodeJavDB(r io.Reader) (image.Image, string, error) {
 	buffered := bufio.NewReader(r)
@@ -27,12 +26,12 @@ func DecodeJavDB(r io.Reader) (image.Image, string, error) {
 		return nil, "", err
 	}
 
-	if isJavDBJPEGHeader(header, 0) {
+	if isJavDBImageHeader(header, 0) {
 		return Decode(buffered)
 	}
 
 	key := header[0]
-	if !isJavDBJPEGHeader(header[1:], key) {
+	if !isJavDBImageHeader(header[1:], key) {
 		return Decode(buffered)
 	}
 	if _, err := buffered.Discard(1); err != nil {
@@ -41,12 +40,17 @@ func DecodeJavDB(r io.Reader) (image.Image, string, error) {
 	return Decode(&javDBXORReader{reader: buffered, key: key})
 }
 
-func isJavDBJPEGHeader(header []byte, key byte) bool {
-	if len(header) < len(javDBJPEGSignature) {
+func isJavDBImageHeader(header []byte, key byte) bool {
+	return matchesXORHeader(header, key, javDBJPEGSignature) ||
+		matchesXORHeader(header, key, javDBPNGSignature)
+}
+
+func matchesXORHeader(header []byte, key byte, signature string) bool {
+	if len(header) < len(signature) {
 		return false
 	}
-	for index, expected := range javDBJPEGSignature {
-		if header[index]^key != expected {
+	for index := 0; index < len(signature); index++ {
+		if header[index]^key != signature[index] {
 			return false
 		}
 	}
